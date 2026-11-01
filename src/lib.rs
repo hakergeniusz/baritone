@@ -21,6 +21,6 @@ pub mod world;
 pub use executor::execute_path;
 pub use goals::{Goal, GoalBlock, GoalNear, GoalTwoBlocks, GoalXZ, GoalYLevel};
 pub use pathing::{
-    BinaryHeapOpenSet, MoveResult, Moves, Path, PathNode, SearchConfig, path_finder,
+    BinaryHeapOpenSet, MoveResult, Moves, Path, PathNode, SearchConfig, ToolSet, path_finder,
 };
 pub use world::{BlockCache, LiveWorld, World};

@@ -1,6 +1,6 @@
 [mod]
 id = "baritone"
-version = "1.1.0"
+version = "1.2.0"
 priority = 100
 
 # The commit it was tested on: it patches the client's tick loop, chat
@@ -62,4 +62,34 @@ target = "horizon_client::game::native_hooks::Game<'_>::native_mods"
 helper = "list.rs"
 bindings = [
   { name = "mods", ty = "&mut Vec<crate::game::native_hooks::NativeMod>", value = "&mut *mods" },
+]
+
+# The mod's commands on the server's command tree, asked once when the
+# server opens: a player's line for one of these reaches "perform" (and
+# the chat box completes them as vanilla's). help and stop are vanilla's
+# there and stay out.
+[[injection]]
+id = "register"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_register_commands"
+helper = "register.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "commands", ty = "&mut Vec<NativeCommand>", value = "&mut *commands" },
+]
+
+# A player's command on the server for one the mod registered: the
+# player's state is swapped in for the call and the answers go out as the
+# command's feedback — the path horizon-ctl's `chat` and other players'
+# chat take, where "command" never runs.
+[[injection]]
+id = "perform"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_perform_command"
+helper = "perform.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "player", ty = "&NativeServerPlayer", value = "player" },
+  { name = "command", ty = "&str", value = "command" },
+  { name = "ran", ty = "&mut bool", value = "&mut *ran" },
 ]

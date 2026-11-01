@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::goals::{Goal, action_costs};
-use crate::pathing::movement::{Moves, movement_breaks};
+use crate::pathing::movement::{Moves, ToolSet, movement_breaks};
 use crate::world::LiveWorld;
 
 /// Cost coefficients for the partial-path bookkeeping
@@ -50,6 +50,11 @@ pub struct PathNode {
     pub cost: f64,
     pub combined_cost: f64,
     pub previous: Option<Arc<PathNode>>,
+    /// The move that created this node from `previous`: kept because the
+    /// delta alone cannot tell the move types apart — a bridge step and a
+    /// traverse share their offset, and the executor behaves differently
+    /// for the two (it stops and places a block over the bridge's hole).
+    pub previous_move: Option<Moves>,
     pub heap_position: i32,
     pub favor: f64,
 }
@@ -67,6 +72,7 @@ impl PathNode {
             cost: action_costs::COST_INF,
             combined_cost: action_costs::COST_INF,
             previous: None,
+            previous_move: None,
             heap_position: -1,
             favor: 0.0,
         }
@@ -265,34 +271,33 @@ impl Path {
 }
 
 /// Reconstruct a Path by walking back `previous` pointers.
-fn reconstruct_path(node: &PathNode, num_nodes: i32, goal: Box<dyn Goal>, world: &LiveWorld) -> Path {
+fn reconstruct_path(
+    node: &PathNode,
+    num_nodes: i32,
+    goal: Box<dyn Goal>,
+    world: &LiveWorld,
+    tools: &ToolSet,
+) -> Path {
     let mut positions: Vec<(i32, i32, i32)> = Vec::new();
+    let mut movements: Vec<Moves> = Vec::new();
     let mut cur: Option<&PathNode> = Some(node);
     while let Some(n) = cur {
         positions.push((n.x, n.y, n.z));
+        // The move that led INTO this node — None only on the start node.
+        if let Some(mv) = n.previous_move {
+            movements.push(mv);
+        }
         cur = n.previous.as_deref();
     }
     positions.reverse();
-
-    // Movements: for each step, determine the move type from the delta.
-    let mut movements: Vec<Moves> = Vec::new();
-    for i in 1..positions.len() {
-        let (px, py, pz) = positions[i - 1];
-        let (cx, cy, cz) = positions[i];
-        let dx = cx - px;
-        let dy = cy - py;
-        let dz = cz - pz;
-        if let Some(m) = Moves::from_delta(dx, dy, dz) {
-            movements.push(m);
-        }
-    }
+    movements.reverse();
 
     // Blocks to mine per step, from the same pricing the search used.
     let mut breaks: Vec<Vec<(i32, i32, i32)>> = Vec::with_capacity(movements.len());
     for i in 1..positions.len() {
         let (px, py, pz) = positions[i - 1];
         breaks.push(match movements.get(i - 1) {
-            Some(mv) => movement_breaks(*mv, world, px, py, pz),
+            Some(mv) => movement_breaks(*mv, world, tools, px, py, pz),
             None => Vec::new(),
         });
     }
@@ -341,11 +346,12 @@ impl Default for SearchConfig {
 }
 
 /// Run A* pathfinding from `start` to `goal`, using the [`LiveWorld`] for
-/// block queries.
+/// block queries and `tools` (the hotbar) for mining times.
 ///
 /// Ported from `AStarPathFinder.findPath`.
 pub fn path_finder(
     world: &LiveWorld,
+    tools: &ToolSet,
     goal: Box<dyn Goal>,
     start: (i32, i32, i32),
     config: &SearchConfig,
@@ -411,14 +417,14 @@ pub fn path_finder(
 
         // Goal check.
         if goal.is_in_goal(current.x, current.y, current.z) {
-            return Some(reconstruct_path(&current, nodes_considered, goal, world));
+            return Some(reconstruct_path(&current, nodes_considered, goal, world, tools));
         }
 
         let current = Arc::new(current);
 
         // Expand neighbors.
         for mv in Moves::all() {
-            let res = mv.cost(world, current.x, current.y, current.z);
+            let res = mv.cost(world, tools, current.x, current.y, current.z);
             if res.cost >= action_costs::COST_INF {
                 continue;
             }
@@ -434,6 +440,7 @@ pub fn path_finder(
                 existing.cost = tentative_g;
                 existing.combined_cost = tentative_g + existing.estimated_cost_to_goal;
                 existing.previous = Some(Arc::clone(&current));
+                existing.previous_move = Some(*mv);
                 open_set.insert(existing.clone());
                 existing.clone()
             } else {
@@ -441,6 +448,7 @@ pub fn path_finder(
                 new_node.cost = tentative_g;
                 new_node.combined_cost = tentative_g + new_node.estimated_cost_to_goal;
                 new_node.previous = Some(Arc::clone(&current));
+                new_node.previous_move = Some(*mv);
                 open_set.insert(new_node.clone());
                 node_map.insert(key, new_node.clone());
                 new_node
@@ -475,7 +483,7 @@ pub fn path_finder(
                 nodes_considered,
                 node_map.len()
             );
-            return Some(reconstruct_path(node, nodes_considered, goal, world));
+            return Some(reconstruct_path(node, nodes_considered, goal, world, tools));
         }
     }
 

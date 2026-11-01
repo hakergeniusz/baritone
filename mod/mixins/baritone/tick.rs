@@ -12,10 +12,36 @@
 
 fn baritone_tick(game: &mut crate::game::Game<'_>) {
     use crate::game::baritone::bot;
+    use std::cell::Cell;
 
-    // Disabled in Options > Mods, or the world closed: drop the mission
-    // and, once, the keys. Runs even while the world is gone.
-    if !game.native_on(bot::ID) || game.player.is_none() {
+    // Every Game ticks this hook — the client, and single player's server
+    // game through its own local path. The server game never has a player
+    // and must not touch the shared bot state (its ticks would drop the
+    // mission ten times a second), so a game only speaks for the bot once
+    // it has actually had a player; each Game runs on its own thread.
+    thread_local! {
+        static EVER_PLAYED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    // No player here: a game that has played just lost its world — drop
+    // the mission and, once, the keys. A game that never had one (the
+    // server's) is not the bot's.
+    if game.player.is_none() {
+        if EVER_PLAYED.replace(false) {
+            let inputs = bot::world_closed_stateful();
+            if inputs.clear {
+                game.keys.remove(&KeyCode::KeyW);
+                game.keys.remove(&KeyCode::Space);
+                game.keys.remove(&KeyCode::ControlLeft);
+                game.left = false;
+            }
+        }
+        return;
+    }
+    EVER_PLAYED.set(true);
+
+    // Disabled in Options > Mods: the same drop and, once, the keys.
+    if !game.native_on(bot::ID) {
         let inputs = bot::world_closed_stateful();
         if inputs.clear {
             game.keys.remove(&KeyCode::KeyW);
@@ -52,6 +78,12 @@ fn baritone_tick(game: &mut crate::game::Game<'_>) {
         health,
         dimension: String::from(game.dim.id()),
         yaw: game.yaw,
+        hotbar: std::array::from_fn(|i| {
+            game.inventory
+                .get(i)
+                .and_then(|s| s.as_ref())
+                .map(|s| String::from(s.item.as_ref()))
+        }),
     };
 
     let (inputs, messages) = {
@@ -81,10 +113,18 @@ fn baritone_tick(game: &mut crate::game::Game<'_>) {
         if let Some(yaw) = inputs.yaw {
             game.yaw = yaw;
         }
+        // Hold the best tool for the block being broken (the brain picked
+        // the slot; the swing only counts while the crosshair really hits).
+        if let Some(slot) = inputs.select {
+            game.selected = slot;
+        }
         if let Some(target) = inputs.mine {
             game.left = aim_at_block(game, [target.0, target.1, target.2]);
         } else {
             game.left = false;
+            if let Some(plan) = &inputs.place {
+                place_block(game, plan);
+            }
         }
     } else if inputs.clear {
         game.keys.remove(&KeyCode::KeyW);
@@ -167,5 +207,51 @@ fn baritone_tick(game: &mut crate::game::Game<'_>) {
             }
             None => false,
         }
+    }
+
+    /// Places a block: aims the view at the face of the first support whose
+    /// face a ray from the eye really hits, then clicks use — the game's
+    /// right click — with the selected slot holding the block. Whether a
+    /// click went out; the brain verifies the block actually appeared (the
+    /// game may refuse one that would land inside the player mid-jump, and
+    /// the brain retries next tick).
+    fn place_block(game: &mut crate::game::Game<'_>, plan: &bot::PlacePlan) -> bool {
+        let Some((origin, _)) = game.aim() else {
+            return false;
+        };
+        let reach = game.reach();
+        for support in &plan.supports {
+            let (sx, sy, sz) = *support;
+            let face = [
+                plan.into.0 - sx,
+                plan.into.1 - sy,
+                plan.into.2 - sz,
+            ];
+            if face.iter().filter(|f| **f != 0).count() != 1 {
+                continue;
+            }
+            let aim = [
+                f64::from(sx) + 0.5 + 0.5 * f64::from(face[0]),
+                f64::from(sy) + 0.5 + 0.5 * f64::from(face[1]),
+                f64::from(sz) + 0.5 + 0.5 * f64::from(face[2]),
+            ];
+            let (dx, dy, dz) = (aim[0] - origin[0], aim[1] - origin[1], aim[2] - origin[2]);
+            let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+            if dist < 0.05 || dist > reach {
+                continue;
+            }
+            let yaw = (-dx).atan2(dz).to_degrees() as f32;
+            let pitch = (-(dy / dist)).asin().to_degrees() as f32;
+            if let Some(hit) = game.clip_ray(origin, view(yaw, pitch), reach)
+                && hit.pos == [sx, sy, sz]
+                && hit.face == face
+            {
+                game.yaw = yaw;
+                game.pitch = pitch.clamp(-90.0, 90.0);
+                let _ = game.use_with_hand();
+                return true;
+            }
+        }
+        false
     }
 }

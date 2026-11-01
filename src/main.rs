@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use std::time::Instant;
 
-use baritone::{Goal, GoalBlock, GoalXZ, SearchConfig, execute_path, path_finder};
+use baritone::{Goal, GoalBlock, GoalXZ, SearchConfig, ToolSet, execute_path, path_finder};
 
 /// Parse command-line args: `baritone X Y Z [--execute]`
 /// - `baritone X Y Z` — find and print path only
@@ -54,7 +54,7 @@ fn main() -> Result<()> {
         "Searching for path (max {} nodes)...",
         SearchConfig::default().max_nodes
     );
-    let path = path_finder(&world, goal, (sx, sy, sz), &SearchConfig::default());
+    let path = path_finder(&world, &ToolSet::hand(), goal, (sx, sy, sz), &SearchConfig::default());
     let elapsed = start.elapsed();
 
     match &path {

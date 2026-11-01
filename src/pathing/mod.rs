@@ -8,5 +8,5 @@
 pub mod movement;
 pub mod search;
 
-pub use movement::{MoveResult, Moves};
+pub use movement::{MoveResult, Moves, tools::ToolSet};
 pub use search::{BinaryHeapOpenSet, Path, PathNode, SearchConfig, path_finder};

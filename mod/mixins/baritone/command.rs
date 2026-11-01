@@ -30,6 +30,12 @@ fn baritone_command(game: &mut crate::game::Game<'_>, command: &str, ran: &mut b
         health: game.player.as_ref().map_or(20.0, |p| p.health.health()),
         dimension: String::from(game.dim.id()),
         yaw: game.yaw,
+        hotbar: std::array::from_fn(|i| {
+            game.inventory
+                .get(i)
+                .and_then(|s| s.as_ref())
+                .map(|s| String::from(s.item.as_ref()))
+        }),
     };
     let (_, messages) = {
         let reader = |x: i32, y: i32, z: i32| game.native_block([x, y, z]);

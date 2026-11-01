@@ -8,31 +8,49 @@
 //! current waypoint, sprint long stretches, jump steps up and parkour
 //! gaps, hop when stuck, and re-plan from wherever the player actually is
 //! when the path stops matching the world. Movements the planner priced
-//! as minable are cleared first: the executor stops, faces the block and
-//! holds attack with the bare hand until it gives way or a timeout says
-//! it will not. `/mine` scans for named blocks and walks to each in turn;
-//! `/tunnel` digs a straight corridor.
+//! as minable are cleared first: the executor stops, switches to the
+//! fastest tool in the hotbar (baritone's `ToolSet`) and holds attack
+//! until the block gives way or a timeout says it will not. `/mine` scans
+//! for named blocks and walks to each in turn; `/tunnel` digs a straight
+//! corridor.
 //!
 //! Movement inputs land the same tick: the game reads its key set after
 //! the tick hook runs.
 
-use std::cell::RefCell;
+use std::sync::{LazyLock, Mutex, PoisonError};
 
 use super::goals::action_costs::COST_INF;
 use super::goals::{Goal, GoalBlock, GoalNear, GoalXZ, GoalYLevel};
 use super::movement::Moves;
 use super::movement::hardness;
+use super::movement::is_placeable;
+use super::movement::tools::ToolSet;
 use super::search::{Path, SearchConfig, path_finder};
 use super::world_view::LiveWorld;
 
 pub const ID: &str = "baritone";
-pub const VERSION: &str = "1.1.0";
+pub const VERSION: &str = "1.2.0";
 pub const DESCRIPTION: &str =
     "Pathfinding bot: walk, sprint, swim, jump and dig to any goal; /mine ores. Ported from Baritone.";
 
 /// Chat commands the mod claims, without their slash.
 const COMMANDS: &[&str] = &[
     "goto", "near", "path", "stop", "cancel", "help", "mine", "tunnel", "status", "eta",
+];
+
+/// The same commands for the server's command tree (`NativeCommand`), one
+/// usage each in the game's `<name:kind>` shape. `help` and `stop` are
+/// vanilla's on the server and left out there — the client-side hook still
+/// answers both, and `/cancel` does `/stop`'s work.
+const COMMAND_USAGES: &[&str] = &[
+    "goto <pos:block_pos>",
+    "near [radius:integer]",
+    "path",
+    "cancel",
+    "status",
+    "eta",
+    "mine <block:word> [radius:integer]",
+    "tunnel [length:integer]",
 ];
 
 /// Node budget per planning run. The search runs on the game's main thread
@@ -51,6 +69,11 @@ const WAYPOINT_Y_TOLERANCE: f64 = 1.1;
 const STUCK_JUMP_TICKS: u64 = 60;
 /// Ticks without progress before a full re-plan from the current position.
 const STUCK_REPLAN_TICKS: u64 = 120;
+/// Ticks without a waypoint advance before a full re-plan from the
+/// current position. Independent of `STUCK_REPLAN_TICKS` because pushing
+/// against a wall can keep shaving micrometers off the best distance
+/// forever; only advancing a waypoint (or breaking a block) is alive.
+const WAYPOINT_STALL_TICKS: u64 = 300;
 /// Failed stuck re-plans before the bot gives up and releases the goal.
 const MAX_STUCK_REPLANS: u8 = 3;
 /// Minimum ticks between any two re-plans (the search costs real frames).
@@ -86,6 +109,9 @@ const MINE_TIMEOUT_FACTOR: f64 = 3.0;
 const MINE_TIMEOUT_SLACK: f64 = 60.0;
 /// Timed-out stints before a block is given up on.
 const MAX_MINE_FAILURES: u32 = 2;
+/// A placement (pillar jump, bridge) that has not landed its block within
+/// this many ticks re-plans against the world as it is.
+const PLACE_GIVE_UP_TICKS: u64 = 60;
 
 /// Where the bot is going, kept in the form the chat command gave it so it
 /// can be rebuilt into a planner goal on every (re)plan — the planner's
@@ -192,6 +218,7 @@ enum MiningOutcome {
 
 /// What the game knows about the player this tick. The helper fills it in;
 /// the brain never touches game types.
+#[derive(Clone)]
 pub struct PlayerInfo {
     pub x: f64,
     pub y: f64,
@@ -205,6 +232,9 @@ pub struct PlayerInfo {
     pub dimension: String,
     /// The player's view yaw, for commands that need a facing (`/tunnel`).
     pub yaw: f32,
+    /// Hotbar item names by slot 0–8, None when empty — decides which
+    /// tool the bot holds while breaking (baritone's `ToolSet`).
+    pub hotbar: [Option<String>; 9],
 }
 
 /// The movement the brain wants applied this tick. While `driving` the
@@ -212,8 +242,17 @@ pub struct PlayerInfo {
 /// driving stops — the game's key set also holds the user's own presses,
 /// so idle ticks must leave it alone. `mine` asks the helper to aim the
 /// view at a block and hold attack on it (only while the crosshair really
-/// hits it).
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// hits it); `select` switches the hotbar to the best tool for it first.
+/// A block to place: `into` is the cell to fill, `supports` the solid
+/// neighbours to place against, best first (the game clicks the first
+/// whose face the crosshair really hits).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlacePlan {
+    pub into: (i32, i32, i32),
+    pub supports: Vec<(i32, i32, i32)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Inputs {
     pub driving: bool,
     pub forward: bool,
@@ -221,6 +260,10 @@ pub struct Inputs {
     pub sprint: bool,
     pub yaw: Option<f32>,
     pub mine: Option<(i32, i32, i32)>,
+    /// A block to place this tick — a pillar's block beneath the jump or
+    /// a bridge's block in the hole ahead. Never set alongside `mine`.
+    pub place: Option<PlacePlan>,
+    pub select: Option<usize>,
     pub clear: bool,
 }
 
@@ -233,6 +276,8 @@ impl Inputs {
             sprint: false,
             yaw: None,
             mine: None,
+            place: None,
+            select: None,
             clear: false,
         }
     }
@@ -246,8 +291,15 @@ pub struct BotState {
     next_index: usize,
     /// Last tick with measurable progress toward the current waypoint.
     progress_tick: u64,
+    /// Last tick a waypoint was advanced or a block was being broken:
+    /// the liveness signal the stuck re-plan falls back on when pushing
+    /// against a wall keeps refreshing `progress_tick` by micrometers.
+    waypoint_tick: u64,
     /// Closest approach to the current waypoint so far.
     best_distance: f64,
+    /// Tick the current placement (pillar jump, bridge hole) began: a
+    /// placement that does not land its block in time re-plans.
+    place_tick: Option<u64>,
     last_plan_tick: u64,
     stuck_replans: u8,
     /// Hold the jump key until this tick.
@@ -262,6 +314,11 @@ pub struct BotState {
     /// Timed-out stints for the block in `last_failure`.
     mining_failures: u32,
     last_failure: Option<(i32, i32, i32)>,
+    /// The playing client's newest `PlayerInfo`, published every tick: the
+    /// server hook answers commands with it, because the server's own view
+    /// of the player (the hub's guest entry) lags behind respawns and
+    /// other teleports.
+    pub last_player: Option<PlayerInfo>,
 }
 
 impl BotState {
@@ -271,7 +328,9 @@ impl BotState {
             path: None,
             next_index: 0,
             progress_tick: 0,
+            waypoint_tick: 0,
             best_distance: f64::INFINITY,
+            place_tick: None,
             last_plan_tick: 0,
             stuck_replans: 0,
             jump_until: 0,
@@ -281,6 +340,7 @@ impl BotState {
             mining: None,
             mining_failures: 0,
             last_failure: None,
+            last_player: None,
         }
     }
 
@@ -297,6 +357,7 @@ impl BotState {
         self.path = None;
         self.next_index = 0;
         self.best_distance = f64::INFINITY;
+        self.place_tick = None;
     }
 }
 
@@ -306,19 +367,25 @@ impl Default for BotState {
     }
 }
 
-thread_local! {
-    static STATE: RefCell<BotState> = RefCell::new(BotState::new());
-}
+/// The bot's state, shared behind a mutex: single player's client tick
+/// drives the bot while its server thread answers commands — the server
+/// is another `Game` on its own thread, so a thread-local would split the
+/// bot in two. A panicked holder leaves the state usable.
+static STATE: LazyLock<Mutex<BotState>> = LazyLock::new(|| Mutex::new(BotState::new()));
 
-/// Runs `f` with the bot's state. The game ticks on one thread, so the
-/// helpers' entry points below are the only users.
+/// Runs `f` with the bot's state. The helpers' entry points below are the
+/// only users.
 pub fn with_state<R>(f: impl FnOnce(&mut BotState) -> R) -> R {
-    STATE.with(|state| f(&mut state.borrow_mut()))
+    let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+    f(&mut state)
 }
 
 /// The helper's per-tick entry point.
 pub fn tick_stateful(world: &LiveWorld<'_>, player: &PlayerInfo) -> (Inputs, Vec<String>) {
-    with_state(|state| tick(state, world, player))
+    with_state(|state| {
+        state.last_player = Some(player.clone());
+        tick(state, world, player)
+    })
 }
 
 /// The helper's chat-command entry point: returns whether the line was one
@@ -349,6 +416,18 @@ pub fn world_closed(state: &mut BotState) -> Inputs {
 /// The names `native_commands` advertises for the chat box.
 pub fn command_names() -> &'static [&'static str] {
     COMMANDS
+}
+
+/// The usages `native_register_commands` pushes onto the server's command
+/// tree.
+pub fn command_usages() -> &'static [&'static str] {
+    COMMAND_USAGES
+}
+
+/// The playing client's newest `PlayerInfo` — the freshest view of the
+/// player any thread can get (`None` before the first tick).
+pub fn published_player() -> Option<PlayerInfo> {
+    with_state(|state| state.last_player.clone())
 }
 
 /// One chat command line (sans slash). Claims only the mod's own commands;
@@ -463,7 +542,7 @@ pub fn handle_command(
             return (true, messages);
         }
         "eta" => {
-            messages.push(eta_line(state, world));
+            messages.push(eta_line(state, world, player));
             return (true, messages);
         }
         "help" => {
@@ -567,8 +646,8 @@ fn status_line(state: &BotState) -> String {
 }
 
 /// One line for `/eta`: the planned cost of the path's remaining
-/// movements, as the planner priced them.
-fn eta_line(state: &BotState, world: &LiveWorld<'_>) -> String {
+/// movements, as the planner priced them (with the player's tools).
+fn eta_line(state: &BotState, world: &LiveWorld<'_>, player: &PlayerInfo) -> String {
     let Some(path) = &state.path else {
         return if state.mission.is_some() {
             "baritone: no path yet — waiting for a plan".to_string()
@@ -576,13 +655,14 @@ fn eta_line(state: &BotState, world: &LiveWorld<'_>) -> String {
             "baritone: no mission".to_string()
         };
     };
+    let tools = ToolSet::new(player.hotbar.clone());
     let positions = path.positions();
     let start = state.next_index.max(1);
     let mut ticks = 0.0;
     for j in start..positions.len() {
         if let Some(mv) = path.movements().get(j - 1) {
             let (x, y, z) = positions[j - 1];
-            ticks += mv.cost(world, x, y, z).cost;
+            ticks += mv.cost(world, &tools, x, y, z).cost;
         }
     }
     let what = match state.mission.as_ref() {
@@ -656,14 +736,19 @@ pub fn tick(
     // Arrival is checked against the goal, not the path's end: a partial
     // path can finish the goal early, and XZ/Y-level goals are satisfied
     // at whatever block first meets them. Mine missions end per target.
-    if let Some(Mission::Goto(spec)) = state.mission {
-        if spec.is_in_goal(block_pos(player)) {
-            messages.push(format!("baritone: reached {}", spec.describe()));
-            state.mission = None;
-            state.mining = None;
-            state.reset_path();
-            return finish(state, false, Inputs::idle(), messages);
-        }
+    // A block goal only counts while standing (or floating) in it: the
+    // feet position rounds, so a jump's apex reads as the block one above
+    // — a pillar goal would "reach" mid-jump and drop the mission before
+    // the block beneath was ever placed.
+    if let Some(Mission::Goto(spec)) = state.mission
+        && (player.on_ground || player.in_water)
+        && spec.is_in_goal(block_pos(player))
+    {
+        messages.push(format!("baritone: reached {}", spec.describe()));
+        state.mission = None;
+        state.mining = None;
+        state.reset_path();
+        return finish(state, false, Inputs::idle(), messages);
     }
 
     // Mine upkeep: collect finished targets, rescan, complete the mission.
@@ -733,6 +818,7 @@ pub fn tick(
             return finish(state, false, Inputs::idle(), messages);
         }
         state.progress_tick = player.ticks;
+        state.waypoint_tick = player.ticks;
     }
 
     // Re-plans, most urgent first: stuck, drifted off the path, routine.
@@ -740,8 +826,9 @@ pub fn tick(
     // planning can fail for one tick (mid-jump the start block is not
     // walkable) without the goal being unreachable.
     let stalled = player.ticks.saturating_sub(state.progress_tick);
+    let no_advance = player.ticks.saturating_sub(state.waypoint_tick);
     let since_plan = player.ticks.saturating_sub(state.last_plan_tick);
-    if stalled >= STUCK_REPLAN_TICKS {
+    if stalled >= STUCK_REPLAN_TICKS || no_advance >= WAYPOINT_STALL_TICKS {
         if state.stuck_replans >= MAX_STUCK_REPLANS {
             messages.push("baritone: still stuck after 3 replans — giving up".to_string());
             state.mission = None;
@@ -752,6 +839,7 @@ pub fn tick(
         state.stuck_replans += 1;
         plan(state, world, player, goal, true, &mut messages);
         state.progress_tick = player.ticks;
+        state.waypoint_tick = player.ticks;
     } else if (off_path(state, player) && since_plan >= REPLAN_COOLDOWN_TICKS)
         || since_plan >= PERIODIC_REPLAN_TICKS
     {
@@ -769,6 +857,19 @@ pub fn tick(
     // Walk through waypoints as they are reached. The final one is left to
     // the goal check above.
     while state.next_index + 1 < positions.len() {
+        // A placement step's waypoint is reached only once we stand on its
+        // level: the pillar's sits a jump above us and the bridge's across
+        // the hole, and the Y tolerance would wave both through — the walk
+        // would strand below them with nothing left to walk to.
+        if placement_pending(
+            &movements,
+            &positions,
+            state.next_index,
+            world,
+            player,
+        ) {
+            break;
+        }
         let center = center_of(positions[state.next_index]);
         let last = state.next_index + 2 == positions.len();
         let reach = if last {
@@ -781,6 +882,7 @@ pub fn tick(
         {
             state.next_index += 1;
             state.progress_tick = player.ticks;
+            state.waypoint_tick = player.ticks;
             state.best_distance = f64::INFINITY;
             state.stuck_replans = 0;
         } else {
@@ -794,6 +896,10 @@ pub fn tick(
         state.best_distance = horizontal;
         state.progress_tick = player.ticks;
     }
+
+    // The hotbar decides mining speed: the planner priced breaks with the
+    // best tool, and the executor holds that slot while breaking.
+    let tools = ToolSet::new(player.hotbar.clone());
 
     // Mining takes the tick: a mine target standing in reach, or the
     // blocks the next step must clear. Both stand still while breaking.
@@ -820,10 +926,11 @@ pub fn tick(
                 } else {
                     ray_to(world, eye, t).unwrap_or(t)
                 };
-                match mining_tick(state, world, player, dig) {
+                match mining_tick(state, world, player, &tools, dig) {
                     MiningOutcome::Hold => {
                         let mut inputs = Inputs::idle();
                         inputs.mine = Some(dig);
+                        inputs.select = tools.best_slot(bare_name(&world.peek(dig.0, dig.1, dig.2)));
                         return finish(state, true, inputs, messages);
                     }
                     MiningOutcome::Failed => {
@@ -875,10 +982,11 @@ pub fn tick(
             None => None,
         };
         if let Some(b) = break_target {
-            match mining_tick(state, world, player, b) {
+            match mining_tick(state, world, player, &tools, b) {
                 MiningOutcome::Hold => {
                     let mut inputs = Inputs::idle();
                     inputs.mine = Some(b);
+                    inputs.select = tools.best_slot(bare_name(&world.peek(b.0, b.1, b.2)));
                     return finish(state, true, inputs, messages);
                 }
                 MiningOutcome::Failed => {
@@ -898,6 +1006,58 @@ pub fn tick(
                     return finish(state, true, Inputs::idle(), messages);
                 }
                 MiningOutcome::TimedOut | MiningOutcome::Nothing => {}
+            }
+        }
+
+        // The planner priced the path against a snapshot of the world: a
+        // chunk that loaded since can hold a solid block where the plan
+        // saw air, and the step's breaks — priced at plan time — say
+        // nothing about it, so walking pushes into it forever. Waypoints
+        // need their feet and head block passable; mine what the world
+        // actually holds, exactly like the step breaks above, once the
+        // waypoint is close enough to be in reach.
+        if horizontal < 2.0 {
+            let wp = positions[state.next_index];
+            let solid: Vec<(i32, i32, i32)> = [(wp.0, wp.1, wp.2), (wp.0, wp.1 + 1, wp.2)]
+                .into_iter()
+                .filter(|p| {
+                    let block = bare_name(&world.peek(p.0, p.1, p.2)).to_string();
+                    !is_passable(&block) && hardness::break_ticks(&block) < COST_INF
+                })
+                .collect();
+            if let Some(b) = solid
+                .iter()
+                .copied()
+                .find(|p| line_of_sight(world, eye, *p))
+                .or_else(|| solid.first().copied())
+            {
+                match mining_tick(state, world, player, &tools, b) {
+                    MiningOutcome::Hold => {
+                        let mut inputs = Inputs::idle();
+                        inputs.mine = Some(b);
+                        inputs.select = tools.best_slot(bare_name(&world.peek(b.0, b.1, b.2)));
+                        return finish(state, true, inputs, messages);
+                    }
+                    MiningOutcome::Failed => {
+                        // The planned path crosses a block that will not
+                        // break: re-plan against the world as it is; if
+                        // that keeps happening, the stuck counter ends
+                        // the mission.
+                        state.stuck_replans += 1;
+                        state.mining = None;
+                        state.reset_path();
+                        if state.stuck_replans >= MAX_STUCK_REPLANS {
+                            messages.push(
+                                "baritone: path blocked by unbreakable terrain — giving up"
+                                    .to_string(),
+                            );
+                            state.mission = None;
+                            return finish(state, false, Inputs::idle(), messages);
+                        }
+                        return finish(state, true, Inputs::idle(), messages);
+                    }
+                    MiningOutcome::TimedOut | MiningOutcome::Nothing => {}
+                }
             }
         }
     }
@@ -920,6 +1080,18 @@ pub fn tick(
     inputs.sprint =
         parkour || (positions.len() - 1 - state.next_index >= SPRINT_MIN_WAYPOINTS && !player.in_water);
 
+    // A step that needs a block placed — a pillar's straight-up jump or a
+    // bridge over a hole — takes the tick: hop and place beneath ourselves,
+    // or hold this block's center and fill the hole ahead. Its waypoint is
+    // not passed until the block is under it, so the walk waits here.
+    match placement_step(state, world, player, &positions, &movements, &mut inputs, &mut messages)
+    {
+        Placement::None => {}
+        Placement::Drive => return finish(state, true, inputs, messages),
+        Placement::Replan => return finish(state, true, Inputs::idle(), messages),
+        Placement::Halt => return finish(state, false, Inputs::idle(), messages),
+    }
+
     if player.on_ground {
         // Step up onto the next block when close to it.
         if aim.1 > player.y + 0.5 && horizontal < 1.6 {
@@ -937,6 +1109,159 @@ pub fn tick(
     inputs.jump = player.ticks < state.jump_until || (player.in_water && aim.1 >= player.y - 0.5);
 
     finish(state, true, inputs, messages)
+}
+
+/// What the current step's placement wants from this tick.
+enum Placement {
+    /// The step needs no placement (or its block is there) — walk on.
+    None,
+    /// Placement inputs were set; drive them.
+    Drive,
+    /// The placement failed; re-plan from here.
+    Replan,
+    /// The placement kept failing; the mission is over.
+    Halt,
+}
+
+/// The placing work for the current step, when it is a pillar or bridge
+/// move that still misses its block: fills `inputs` with the stand-jump-
+/// place behavior (pillar) or the hold-the-edge-and-fill behavior
+/// (bridge) and reports [`Placement::Drive`]. Anything else — a walking
+/// step, a block already placed, a walk still short of the pillar base —
+/// reports [`Placement::None`] and leaves the inputs alone.
+fn placement_step(
+    state: &mut BotState,
+    world: &LiveWorld<'_>,
+    player: &PlayerInfo,
+    positions: &[(i32, i32, i32)],
+    movements: &[Moves],
+    inputs: &mut Inputs,
+    messages: &mut Vec<String>,
+) -> Placement {
+    let i = state.next_index;
+    let (dx, dz, pillar) = match i.checked_sub(1).and_then(|j| movements.get(j).copied()) {
+        Some(Moves::PillarUp) => (0, 0, true),
+        Some(Moves::BridgeNorth) => (0, -1, false),
+        Some(Moves::BridgeSouth) => (0, 1, false),
+        Some(Moves::BridgeEast) => (1, 0, false),
+        Some(Moves::BridgeWest) => (-1, 0, false),
+        _ => {
+            state.place_tick = None;
+            return Placement::None;
+        }
+    };
+    let wp = positions[i];
+    let into = (wp.0, wp.1 - 1, wp.2);
+    let block = bare_name(&world.peek(into.0, into.1, into.2)).to_string();
+    if !is_passable(&block) {
+        // Placed already — by us or by the world: walk on.
+        state.place_tick = None;
+        return Placement::None;
+    }
+
+    // A pillar waits for nothing while we are still walking to its base.
+    if pillar && distance_xz(player, center_of(wp)) > 1.5 {
+        state.place_tick = None;
+        return Placement::None;
+    }
+
+    // Give up on a placement that will not land: the slot may have run dry
+    // (the path was priced on blocks no longer held) or the geometry may
+    // have changed under the plan. Re-plan against the world as it is; if
+    // that keeps happening, the stuck counter ends the mission.
+    let started = *state.place_tick.get_or_insert(player.ticks);
+    let slot = player
+        .hotbar
+        .iter()
+        .position(|s| s.as_deref().is_some_and(is_placeable));
+    if player.ticks.saturating_sub(started) > PLACE_GIVE_UP_TICKS || slot.is_none() {
+        state.place_tick = None;
+        state.stuck_replans += 1;
+        state.reset_path();
+        if state.stuck_replans >= MAX_STUCK_REPLANS {
+            messages.push("baritone: can't place a block for the path — giving up".to_string());
+            state.mission = None;
+            return Placement::Halt;
+        }
+        messages.push(format!(
+            "baritone: can't place ({}, {}, {}) — re-planning",
+            into.0, into.1, into.2
+        ));
+        return Placement::Replan;
+    }
+
+    // What to place against: the pillar's support is the block below —
+    // its top face takes the click while we hang above it. A bridge
+    // places against one of the hole's solid horizontal neighbours, the
+    // far side first; the block under us never serves (from above, its
+    // top face occludes the side face the placement needs). The game
+    // clicks the first whose face the crosshair really hits.
+    let supports: Vec<(i32, i32, i32)> = if pillar {
+        vec![(into.0, into.1 - 1, into.2)]
+    } else {
+        [
+            (into.0 + dx, into.1, into.2 + dz),
+            (into.0 + dz, into.1, into.2 + dx),
+            (into.0 - dz, into.1, into.2 - dx),
+        ]
+        .into_iter()
+        .filter(|p| {
+            let b = bare_name(&world.peek(p.0, p.1, p.2)).to_string();
+            !is_passable(&b)
+        })
+        .collect()
+    };
+
+    inputs.forward = false;
+    inputs.sprint = false;
+    if pillar {
+        // Center on the block, hop, and place while high enough that the
+        // new block clears our box — feet at or above its top face.
+        inputs.forward = distance_xz(player, center_of(wp)) > 0.2;
+        if player.on_ground {
+            inputs.jump = true;
+        } else if player.y >= f64::from(into.1) + 1.0 {
+            inputs.place = Some(PlacePlan { into, supports });
+            inputs.select = slot;
+        }
+    } else {
+        // Walk up to this block's center, then hold: from there the ray
+        // to the far side's face passes over the hole and the click can
+        // land. The placement is issued every tick until the hole is
+        // filled; the game verifies the geometry before clicking.
+        let cur = center_of(positions[i - 1]);
+        let along = (player.x - cur.0) * f64::from(dx) + (player.z - cur.2) * f64::from(dz);
+        inputs.forward = along < 0.15;
+        inputs.place = Some(PlacePlan { into, supports });
+        inputs.select = slot;
+    }
+    Placement::Drive
+}
+
+/// Whether the waypoint at `i` still lacks what its placement step needs:
+/// a bridge's hole is unfilled, or a pillar's level is not ours yet (the
+/// block below its waypoint goes in mid-jump, and the Y tolerance alone
+/// would wave the waypoint through while we are still below it).
+fn placement_pending(
+    movements: &[Moves],
+    positions: &[(i32, i32, i32)],
+    i: usize,
+    world: &LiveWorld<'_>,
+    player: &PlayerInfo,
+) -> bool {
+    let Some(mv) = i.checked_sub(1).and_then(|j| movements.get(j).copied()) else {
+        return false;
+    };
+    let wp = match mv {
+        Moves::PillarUp | Moves::BridgeNorth | Moves::BridgeSouth | Moves::BridgeEast
+        | Moves::BridgeWest => positions[i],
+        _ => return false,
+    };
+    if matches!(mv, Moves::PillarUp) {
+        return block_pos(player).1 != wp.1;
+    }
+    let block = bare_name(&world.peek(wp.0, wp.1 - 1, wp.2)).to_string();
+    is_passable(&block)
 }
 
 /// The goal the planner should head for: the mission's own, or the mine's
@@ -1013,11 +1338,13 @@ fn maintain_mine(state: &mut BotState, world: &LiveWorld<'_>, player: &PlayerInf
 }
 
 /// One tick of breaking `target`: keeps or restarts the stint, watches the
-/// timeout, and reports what the caller should do.
+/// timeout, and reports what the caller should do. `tools` prices the
+/// timeout — the stint has the hotbar's best tool, not the bare hand.
 fn mining_tick(
     state: &mut BotState,
     world: &LiveWorld<'_>,
     player: &PlayerInfo,
+    tools: &ToolSet,
     target: (i32, i32, i32),
 ) -> MiningOutcome {
     let block = bare_name(&world.peek(target.0, target.1, target.2)).to_string();
@@ -1035,7 +1362,7 @@ fn mining_tick(
             stint.name = block.clone();
             stint.started = player.ticks;
         }
-        let expected = hardness::break_ticks(&stint.name);
+        let expected = tools.break_ticks_with(&stint.name);
         let factor = if player.in_water {
             MINE_TIMEOUT_FACTOR * 2.0
         } else {
@@ -1054,6 +1381,7 @@ fn mining_tick(
         }
         // Breaking is progress: the stuck timers must not fire mid-mine.
         state.progress_tick = player.ticks;
+        state.waypoint_tick = player.ticks;
         return MiningOutcome::Hold;
     }
 
@@ -1068,6 +1396,7 @@ fn mining_tick(
         started: player.ticks,
     });
     state.progress_tick = player.ticks;
+    state.waypoint_tick = player.ticks;
     MiningOutcome::Hold
 }
 
@@ -1226,7 +1555,8 @@ fn plan(
         max_nodes: MAX_NODES,
         ..SearchConfig::default()
     };
-    let Some(path) = path_finder(world, goal.to_goal(), block_pos(player), &config) else {
+    let tools = ToolSet::new(player.hotbar.clone());
+    let Some(path) = path_finder(world, &tools, goal.to_goal(), block_pos(player), &config) else {
         return false;
     };
     let partial = !goal.is_in_goal(path.dest());
@@ -1322,6 +1652,20 @@ mod tests {
             health: 20.0,
             dimension: String::from("minecraft:overworld"),
             yaw,
+            hotbar: std::array::from_fn(|_| None),
+        }
+    }
+
+    fn player_with_hotbar(
+        x: f64,
+        y: f64,
+        z: f64,
+        ticks: u64,
+        hotbar: [Option<String>; 9],
+    ) -> PlayerInfo {
+        PlayerInfo {
+            hotbar,
+            ..player_at(x, y, z, ticks)
         }
     }
 
@@ -1346,8 +1690,12 @@ mod tests {
 
     /// Walks a mission out on flat ground: slides the player toward the
     /// aimed waypoint while the bot holds forward, deletes the block it
-    /// mines, and returns when the mission ends. The world is rebuilt from
-    /// the (mutated) map every tick, like a real one streaming back.
+    /// mines, places the held block where the bot places, and returns when
+    /// the mission ends. The world is rebuilt from the (mutated) map every
+    /// tick, like a real one streaming back. Vertical motion is crudely
+    /// simulated so pillar jumps work: a jump rises 0.42 a tick with drag
+    /// and gravity, and the feet land on the highest solid block top below
+    /// them.
     fn drive(
         blocks: &mut HashMap<(i32, i32, i32), &'static str>,
         state: &mut BotState,
@@ -1355,6 +1703,8 @@ mod tests {
     ) -> Vec<String> {
         let mut messages = Vec::new();
         let mut forward = true;
+        let mut jump = false;
+        let mut vy = 0.0_f64;
         for _ in 0..4_000 {
             let snapshot = blocks.clone();
             let reader = reader(&snapshot);
@@ -1374,11 +1724,45 @@ mod tests {
                     }
                 }
             }
+            if jump && player.on_ground {
+                player.on_ground = false;
+                vy = 0.42;
+            }
+            if !player.on_ground {
+                player.y += vy;
+                vy = (vy - 0.08) * 0.98;
+                let bx = player.x.floor() as i32;
+                let bz = player.z.floor() as i32;
+                let feet = player.y.floor() as i32;
+                let solid = |y: i32| {
+                    blocks
+                        .get(&(bx, y, bz))
+                        .is_some_and(|b| !super::is_passable(b))
+                };
+                let top = (feet - 8..=feet)
+                    .rev()
+                    .find(|y| solid(*y))
+                    .map(|y| f64::from(y + 1));
+                if vy < 0.0
+                    && let Some(top) = top
+                    && player.y <= top
+                {
+                    player.y = top;
+                    player.on_ground = true;
+                    vy = 0.0;
+                }
+            }
             let (inputs, tick_messages) = tick(state, &world, player);
             messages = tick_messages;
             forward = inputs.forward;
+            jump = inputs.jump;
             if let Some(pos) = inputs.mine {
                 blocks.remove(&pos);
+            }
+            if let Some(plan) = &inputs.place {
+                // The game places the held slot's block; the tests give
+                // dirt, so the filled cell reads as dirt.
+                blocks.insert(plan.into, "minecraft:dirt");
             }
             if state.mission.is_none() {
                 break;
@@ -1694,6 +2078,221 @@ mod tests {
     }
 
     #[test]
+    fn mines_a_block_that_changed_under_the_path() {
+        // The plan priced a waypoint's block as air (a chunk that had not
+        // loaded yet); by execution time the world holds oak_leaves there.
+        // Walking into it forever is the failure mode this covers: the
+        // executor re-verifies the waypoint's feet/head blocks and mines
+        // what actually stands there, then walks on to the goal.
+        let mut blocks = HashMap::new();
+        stone_floor(&mut blocks, 40);
+        let mut state = BotState::new();
+        let mut player = player_at(0.0, 65.0, 0.0, 100);
+        let planted = {
+            let reader = reader(&blocks);
+            let world = LiveWorld::new(&reader);
+            handle_command(&mut state, "goto 12 65 0", &player, &world);
+            tick(&mut state, &world, &player);
+            let path = state.path.as_ref().expect("planned east");
+            path.positions()[3]
+        };
+        blocks.insert(planted, "minecraft:oak_leaves");
+        let messages = drive(&mut blocks, &mut state, &mut player);
+        assert!(
+            messages.iter().any(|m| m.contains("reached")),
+            "expected to arrive, got: {messages:?}"
+        );
+        assert_eq!(
+            blocks.get(&planted).copied(),
+            None,
+            "the world-changed block was never mined"
+        );
+    }
+
+    #[test]
+    fn gives_up_when_no_waypoint_ever_advances() {
+        // A big floor (the search runs out of nodes well short of the
+        // goal, so every plan is a partial) and the goal sealed inside a
+        // bedrock pocket — every neighbour of its cell and everything
+        // above it solid, so no placing move can climb in either. Once
+        // the partials start ending at the pocket, no waypoint past them
+        // can ever be reached and no block on the way is breakable. The
+        // liveness timer must end the mission instead of pressing into
+        // the wall forever.
+        let mut blocks = HashMap::new();
+        stone_floor(&mut blocks, 80);
+        for x in 59..=61 {
+            for y in 65..=80 {
+                for z in 59..=61 {
+                    if (x, y, z) != (60, 65, 60) {
+                        blocks.insert((x, y, z), "minecraft:bedrock");
+                    }
+                }
+            }
+        }
+        let mut state = BotState::new();
+        let mut player = player_at(0.0, 65.0, 0.0, 100);
+        {
+            let reader = reader(&blocks);
+            let world = LiveWorld::new(&reader);
+            handle_command(&mut state, "goto 60 65 60", &player, &world);
+        }
+        let messages = drive(&mut blocks, &mut state, &mut player);
+        assert!(
+            messages.iter().any(|m| m.contains("giving up")),
+            "expected a stuck give-up, got: {messages:?}"
+        );
+        assert!(state.mission.is_none());
+    }
+
+    #[test]
+    fn pillars_up_to_a_goal_in_the_sky() {
+        // Flat ground, the goal one block above it: there is no step to
+        // climb and nowhere to ascend from, so the pillar jump is the only
+        // way up — and it needs a block in the hotbar. The bot hops, places
+        // beneath itself while high enough that the block clears its box,
+        // and lands on it.
+        let mut blocks = HashMap::new();
+        stone_floor(&mut blocks, 6);
+        let mut state = BotState::new();
+        let mut player = player_with_hotbar(
+            0.0,
+            65.0,
+            0.0,
+            100,
+            std::array::from_fn(|i| (i == 0).then(|| "minecraft:dirt".to_string())),
+        );
+        {
+            let reader = reader(&blocks);
+            let world = LiveWorld::new(&reader);
+            handle_command(&mut state, "goto 0 66 0", &player, &world);
+            tick(&mut state, &world, &player);
+        }
+        assert!(
+            state
+                .path
+                .as_ref()
+                .expect("a pillar path")
+                .movements()
+                .contains(&Moves::PillarUp),
+            "expected a pillar jump in the plan"
+        );
+        let messages = drive(&mut blocks, &mut state, &mut player);
+        assert!(
+            messages.iter().any(|m| m.contains("reached")),
+            "messages: {messages:?}"
+        );
+        assert_eq!(
+            blocks.get(&(0, 65, 0)).copied(),
+            Some("minecraft:dirt"),
+            "the pillar block was never placed"
+        );
+    }
+
+    #[test]
+    fn bridges_a_hole_in_the_floor() {
+        // A one-block causeway between two walls, with a four-block gap:
+        // too wide for a parkour jump (every landing is the gap itself),
+        // bottomless below (no descend), and the walls price any walk-
+        // around at a bare-hand mining fortune. The only way over is the
+        // bridge, placing against the wall bases beside the gap.
+        let mut blocks = HashMap::new();
+        stone_floor(&mut blocks, 12);
+        for x in 5..=8 {
+            blocks.remove(&(x, 64, 0));
+        }
+        for x in -12..=12 {
+            for y in 65..=67 {
+                for z in [-1, 1] {
+                    blocks.insert((x, y, z), "minecraft:stone");
+                }
+            }
+        }
+        let mut state = BotState::new();
+        let mut player = player_with_hotbar(
+            0.0,
+            65.0,
+            0.0,
+            100,
+            std::array::from_fn(|i| (i == 0).then(|| "minecraft:dirt".to_string())),
+        );
+        {
+            let reader = reader(&blocks);
+            let world = LiveWorld::new(&reader);
+            handle_command(&mut state, "goto 8 65 0", &player, &world);
+            tick(&mut state, &world, &player);
+        }
+        assert!(
+            state
+                .path
+                .as_ref()
+                .expect("a bridge path")
+                .movements()
+                .iter()
+                .any(|m| matches!(m, Moves::BridgeEast)),
+            "expected a bridge in the plan: {:?}",
+            state.path.as_ref().map(|p| p.movements().to_vec())
+        );
+        let messages = drive(&mut blocks, &mut state, &mut player);
+        assert!(
+            messages.iter().any(|m| m.contains("reached")),
+            "messages: {messages:?}"
+        );
+        assert_eq!(
+            blocks.get(&(5, 64, 0)).copied(),
+            Some("minecraft:dirt"),
+            "the hole was never bridged"
+        );
+    }
+
+    #[test]
+    fn prices_placements_as_impassable_without_a_block_to_place() {
+        // The same walled causeway and gap, but the hotbar holds only a
+        // pickaxe: every placing move is priced impassable. A path still
+        // exists — mining through the wall with the pickaxe — but it must
+        // not lean on blocks the bot does not have.
+        let mut blocks = HashMap::new();
+        stone_floor(&mut blocks, 12);
+        for x in 5..=8 {
+            blocks.remove(&(x, 64, 0));
+        }
+        for x in -12..=12 {
+            for y in 65..=67 {
+                for z in [-1, 1] {
+                    blocks.insert((x, y, z), "minecraft:stone");
+                }
+            }
+        }
+        let mut state = BotState::new();
+        let player = player_with_hotbar(
+            0.0,
+            65.0,
+            0.0,
+            100,
+            std::array::from_fn(|i| (i == 0).then(|| "minecraft:diamond_pickaxe".to_string())),
+        );
+        {
+            let reader = reader(&blocks);
+            let world = LiveWorld::new(&reader);
+            handle_command(&mut state, "goto 8 65 0", &player, &world);
+            tick(&mut state, &world, &player);
+        }
+        let path = state.path.expect("a path still exists");
+        assert!(
+            path.movements().iter().all(|m| !matches!(
+                m,
+                Moves::PillarUp
+                    | Moves::BridgeNorth
+                    | Moves::BridgeSouth
+                    | Moves::BridgeEast
+                    | Moves::BridgeWest
+            )),
+            "planned a placement with nothing to place: {:?}",
+            path.movements()
+        );
+    }
+
+    #[test]
     fn mines_through_a_dirt_wall() {
         // Stone floor, a tall dirt wall across the whole map at x = 5, and
         // a goal beyond it: climbing over would mine more than going
@@ -1748,6 +2347,72 @@ mod tests {
         assert!(messages.iter().any(|m| m.contains("mine done — 2 × iron_ore")));
         assert!(!blocks.contains_key(&(6, 65, 0)));
         assert!(!blocks.contains_key(&(-6, 65, 0)));
+    }
+
+    #[test]
+    fn mining_selects_the_best_hotbar_slot() {
+        let mut blocks = HashMap::new();
+        stone_floor(&mut blocks, 40);
+        // An ore next to the player: in reach on the first tick.
+        blocks.insert((2, 65, 0), "minecraft:iron_ore");
+        let mut state = BotState::new();
+        let mut player = player_at(0.0, 65.0, 0.0, 100);
+        player.hotbar[1] = Some(String::from("minecraft:dirt"));
+        player.hotbar[5] = Some(String::from("minecraft:stone_pickaxe"));
+        {
+            let reader = reader(&blocks);
+            let world = LiveWorld::new(&reader);
+            let (claimed, _) = handle_command(&mut state, "mine iron_ore", &player, &world);
+            assert!(claimed);
+            let (inputs, _) = tick(&mut state, &world, &player);
+            assert_eq!(inputs.mine, Some((2, 65, 0)));
+            // The stone pickaxe is held for the ore; the dirt in slot 1
+            // does nothing for it.
+            assert_eq!(inputs.select, Some(5));
+        }
+
+        // A tool under the ore's harvest gate is still held when it swings
+        // faster: the wooden pickaxe pays the no-harvest divisor but at
+        // double the hand's speed (150 ticks vs 300), and drops nothing.
+        let mut player = player_at(0.0, 65.0, 0.0, 100);
+        player.hotbar[0] = Some(String::from("minecraft:wooden_pickaxe"));
+        let mut state = BotState::new();
+        {
+            let reader = reader(&blocks);
+            let world = LiveWorld::new(&reader);
+            handle_command(&mut state, "mine iron_ore", &player, &world);
+            let (inputs, _) = tick(&mut state, &world, &player);
+            assert_eq!(inputs.select, Some(0));
+        }
+    }
+
+    #[test]
+    fn powder_snow_is_never_routed_over() {
+        use super::super::movement::can_walk_on;
+
+        let mut blocks = HashMap::new();
+        stone_floor(&mut blocks, 8);
+        // A drift across the way: the live bot sank in and froze — the
+        // planner must treat it as ground it cannot stand on.
+        for x in 1..=3 {
+            blocks.insert((x, 64, 0), "minecraft:powder_snow");
+        }
+        let reader = reader(&blocks);
+        let world = LiveWorld::new(&reader);
+        assert!(!can_walk_on(&world, 2, 64, 0));
+        assert!(can_walk_on(&world, 0, 64, 0));
+
+        let mut state = BotState::new();
+        let player = player_at(0.0, 65.0, 0.0, 100);
+        handle_command(&mut state, "goto 6 65 0", &player, &world);
+        tick(&mut state, &world, &player);
+        let path = state.path.as_ref().expect("a path around the drift");
+        for (x, y, z) in path.positions() {
+            assert!(
+                !(1..=3).contains(x) || *y != 65 || *z != 0,
+                "the path stands on the drift at ({x}, {y}, {z})"
+            );
+        }
     }
 
     #[test]
@@ -1825,8 +2490,9 @@ mod tests {
         let mut state = BotState::new();
         // Stone needs 150 ticks bare-handed; the timeout is 3× + slack.
         let player = player_at(0.0, 65.0, 0.0, 1_000);
+        let tools = ToolSet::hand();
         assert_eq!(
-            mining_tick(&mut state, &world, &player, (1, 66, 0)),
+            mining_tick(&mut state, &world, &player, &tools, (1, 66, 0)),
             MiningOutcome::Hold
         );
         assert_eq!(
@@ -1837,26 +2503,26 @@ mod tests {
         // Well before the timeout: still holding.
         let later = player_at(0.0, 65.0, 0.0, 1_400);
         assert_eq!(
-            mining_tick(&mut state, &world, &later, (1, 66, 0)),
+            mining_tick(&mut state, &world, &later, &tools, (1, 66, 0)),
             MiningOutcome::Hold
         );
 
         // Past it: one strike, the stint is dropped for a restart.
         let late = player_at(0.0, 65.0, 0.0, 2_000);
         assert_eq!(
-            mining_tick(&mut state, &world, &late, (1, 66, 0)),
+            mining_tick(&mut state, &world, &late, &tools, (1, 66, 0)),
             MiningOutcome::TimedOut
         );
         assert_eq!(state.mining, None);
 
         // A fresh stint failing again: two strikes, give up.
         assert_eq!(
-            mining_tick(&mut state, &world, &late, (1, 66, 0)),
+            mining_tick(&mut state, &world, &late, &tools, (1, 66, 0)),
             MiningOutcome::Hold
         );
         let later_still = player_at(0.0, 65.0, 0.0, 3_000);
         assert_eq!(
-            mining_tick(&mut state, &world, &later_still, (1, 66, 0)),
+            mining_tick(&mut state, &world, &later_still, &tools, (1, 66, 0)),
             MiningOutcome::Failed
         );
     }
@@ -2071,7 +2737,12 @@ mod tests {
         let world = LiveWorld::new(&reader);
 
         let mut state = BotState::new();
-        let player = player_at(20.5, 109.0, 6.5, 100);
+        // The player carries the tools a mining trip implies: without them
+        // the pocket's stone walls price at hand speed (150 ticks/block)
+        // and no path fits the node budget — baritone makes the same
+        // assumption (its ToolSet is always given the real inventory).
+        let mut player = player_at(20.5, 109.0, 6.5, 100);
+        player.hotbar[0] = Some(String::from("minecraft:diamond_pickaxe"));
         let (claimed, _) = handle_command(&mut state, "goto 20 109 0", &player, &world);
         assert!(claimed);
 

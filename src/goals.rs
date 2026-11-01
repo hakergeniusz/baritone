@@ -39,6 +39,10 @@ pub mod action_costs {
     pub const WALK_OFF_BLOCK_COST: f64 = WALK_ONE_BLOCK_COST * 0.8;
     /// Cost to recenter after a 1-block fall.
     pub const CENTER_AFTER_FALL_COST: f64 = WALK_ONE_BLOCK_COST - WALK_OFF_BLOCK_COST;
+    /// Placing one block (aim at the support's face, click use): a click
+    /// lands the same tick and the block appears the next, with a little
+    /// aim-settling slack.
+    pub const PLACE_BLOCK_COST: f64 = 4.0;
     /// "Infinite" cost — unreachable. Not MAX to avoid overflow when added.
     pub const COST_INF: f64 = 1_000_000.0;
     /// Deepest unprotected fall (no water, no bucket, no ladder) the planner
