@@ -13,12 +13,14 @@
 //! - [`world`]: World model that queries Horizon's control socket for block
 //!   states and player position.
 
+pub mod executor;
 pub mod goals;
 pub mod pathing;
 pub mod world;
-pub mod executor;
 
-pub use goals::{Goal, GoalBlock, GoalNear, GoalTwoBlocks, GoalXZ, GoalYLevel};
-pub use pathing::{path_finder, BinaryHeapOpenSet, MoveResult, Moves, Path, PathNode, SearchConfig};
-pub use world::{BlockCache, LiveWorld, World};
 pub use executor::execute_path;
+pub use goals::{Goal, GoalBlock, GoalNear, GoalTwoBlocks, GoalXZ, GoalYLevel};
+pub use pathing::{
+    BinaryHeapOpenSet, MoveResult, Moves, Path, PathNode, SearchConfig, path_finder,
+};
+pub use world::{BlockCache, LiveWorld, World};

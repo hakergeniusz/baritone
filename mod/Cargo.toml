@@ -1,0 +1,12 @@
+[package]
+name = "horizon-baritone"
+version = "1.1.0"
+edition = "2024"
+license = "LGPL-3.0"
+description = "Pathfinding bot: walk, sprint, swim, jump and dig to any goal; /mine ores. Ported from Baritone."
+publish = false
+
+# The runtime doubles as the mod's library (its tests) and the module the
+# bundle injects into the game; the helper files compile only inside it.
+[lib]
+path = "mixins/baritone/runtime.rs"

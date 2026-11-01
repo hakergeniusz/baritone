@@ -1,0 +1,65 @@
+[mod]
+id = "baritone"
+version = "1.1.0"
+priority = 100
+
+# The commit it was tested on: it patches the client's tick loop, chat
+# command dispatch and mods list, so a Horizon change there needs a
+# re-check.
+[compatibility]
+horizon_revision = "af55a734865da4f1b11836164a979ff06a1f0449"
+
+# The mod's brain: the ported planner plus the bot's state machine, pure
+# standard library, tested on its own.
+[[module]]
+id = "runtime"
+file = "crates/horizon-client/src/game.rs"
+name = "baritone"
+source = "runtime.rs"
+
+# Once a tick: plan when needed, drive the player with injected keys. Runs
+# before the game reads its key set for the motion tick, so a waypoint's
+# turn applies the same tick.
+[[injection]]
+id = "tick"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_tick"
+helper = "tick.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+]
+
+# Chat commands, claimed before the game's own ones in single-player: this
+# answers /goto, /near, /path, /stop, /cancel and /help and leaves every
+# other line alone.
+[[injection]]
+id = "command"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_command"
+helper = "command.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "command", ty = "&str", value = "command" },
+  { name = "ran", ty = "&mut bool", value = "&mut *ran" },
+]
+
+# The command names the chat box completes and colours as the game's own.
+[[injection]]
+id = "commands"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_commands"
+helper = "commands.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "commands", ty = "&mut Vec<&'static str>", value = "&mut *commands" },
+]
+
+# The row in Options > Mods.
+[[injection]]
+id = "list"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_mods"
+helper = "list.rs"
+bindings = [
+  { name = "mods", ty = "&mut Vec<crate::game::native_hooks::NativeMod>", value = "&mut *mods" },
+]

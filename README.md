@@ -16,7 +16,7 @@ from the original Baritone source. The full license text is in [`LICENCE`](LICEN
 | `goals` | Pathing goals (GoalXZ, GoalBlock, GoalNear, etc.) and action cost constants (movement speeds, fall costs, etc.). |
 | `pathing` | A* search engine (`path_finder`), binary heap open-set, and movement cost calculations (walk, ascend, descend, fall, diagonal, parkour). |
 | `world` | World model that queries Horizon's control socket for block states and player position, with a region cache. |
-| `executor` | Path executor that sends `goto`/`break`/`place` commands to Horizon via its control socket. |
+| `executor` | Path executor that sends `goto` commands to Horizon via its control socket, verifying the player's position after each segment. |
 
 ### Ported from Baritone (LGPL-3.0)
 
@@ -40,6 +40,19 @@ HORIZON_CONTROL=/tmp/my-horizon.sock baritone 100 65 -50      # find path only
 HORIZON_CONTROL=/tmp/my-horizon.sock baritone 100 65 -50 --execute  # find + walk the path
 baritone 100 -50                                             # GoalXZ (long-distance, any Y)
 ```
+
+## Divergences from Baritone
+
+The executor delegates movement to Horizon's `goto` command, which walks but
+cannot mine or place blocks. Accordingly:
+
+- Movements that would require mining or placing blocks are impassable in the
+  planner (`COST_INF`) — where Baritone would mine through or bridge over
+  them. Every planned path is walk-only, so the executor can actually follow it.
+- Leaves are treated as the solid cubes they are (walking through a canopy is
+  impossible without mining). Standing and walking *on* leaves works.
+- Goal heuristics (`GoalBlock`, `GoalYLevel`, `GoalTwoBlocks`, `GoalNear`,
+  `GoalXZ`) are ported verbatim from `baritone.api.pathing.goals`.
 
 ## Building
 

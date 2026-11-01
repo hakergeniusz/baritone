@@ -9,7 +9,7 @@
 use std::env;
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 /// Default control socket path (from horizon-ctl's `--socket` option or
 /// `$XDG_RUNTIME_DIR/horizon-control.sock`).
@@ -31,11 +31,15 @@ pub struct World {
 
 impl World {
     pub fn new() -> Result<Self> {
-        Ok(World { socket_path: default_socket() })
+        Ok(World {
+            socket_path: default_socket(),
+        })
     }
 
     pub fn with_socket(path: impl Into<PathBuf>) -> Result<Self> {
-        let w = World { socket_path: path.into() };
+        let w = World {
+            socket_path: path.into(),
+        };
         w.check_alive()?;
         Ok(w)
     }
@@ -125,14 +129,14 @@ impl World {
         let mut results = Vec::new();
         if let Some(arr) = resp.get("blocks").and_then(|b| b.as_array()) {
             for entry in arr {
-                if let Some(arr) = entry.as_array() {
-                    if arr.len() >= 4 {
-                        let x = arr[0].as_i64().unwrap_or(0) as i32;
-                        let y = arr[1].as_i64().unwrap_or(0) as i32;
-                        let z = arr[2].as_i64().unwrap_or(0) as i32;
-                        let name = arr[3].as_str().unwrap_or("minecraft:air").to_string();
-                        results.push((x, y, z, name));
-                    }
+                if let Some(arr) = entry.as_array()
+                    && arr.len() >= 4
+                {
+                    let x = arr[0].as_i64().unwrap_or(0) as i32;
+                    let y = arr[1].as_i64().unwrap_or(0) as i32;
+                    let z = arr[2].as_i64().unwrap_or(0) as i32;
+                    let name = arr[3].as_str().unwrap_or("minecraft:air").to_string();
+                    results.push((x, y, z, name));
                 }
             }
         }
@@ -218,7 +222,13 @@ impl LiveWorld {
         // We cap the box to fit (32^3 = 32768).
         let max_side: i32 = 31; // safe limit
         let total = (size as i64) * (size as i64) * (size as i64);
-        log::debug!("prefetching {} blocks around ({}, {}, {})", total, px, py, pz);
+        log::debug!(
+            "prefetching {} blocks around ({}, {}, {})",
+            total,
+            px,
+            py,
+            pz
+        );
 
         let x1 = px - r;
         let y1 = (py - r).max(0);

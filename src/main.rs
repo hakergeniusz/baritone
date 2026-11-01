@@ -1,7 +1,7 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::time::Instant;
 
-use baritone::{execute_path, path_finder, Goal, GoalBlock, GoalXZ, SearchConfig};
+use baritone::{Goal, GoalBlock, GoalXZ, SearchConfig, execute_path, path_finder};
 
 /// Parse command-line args: `baritone X Y Z [--execute]`
 /// - `baritone X Y Z` — find and print path only
@@ -24,16 +24,16 @@ fn main() -> Result<()> {
         2 => {
             let x = coords[0].parse::<i32>().map_err(|_| anyhow!("invalid X"))?;
             let z = coords[1].parse::<i32>().map_err(|_| anyhow!("invalid Z"))?;
-            (
-                Box::new(GoalXZ::new(x, z)),
-                format!("XZ=({x}, {z})"),
-            )
+            (Box::new(GoalXZ::new(x, z)), format!("XZ=({x}, {z})"))
         }
         3 => {
             let x = coords[0].parse::<i32>().map_err(|_| anyhow!("invalid X"))?;
             let y = coords[1].parse::<i32>().map_err(|_| anyhow!("invalid Y"))?;
             let z = coords[2].parse::<i32>().map_err(|_| anyhow!("invalid Z"))?;
-            (Box::new(GoalBlock::new(x, y, z)), format!("({x}, {y}, {z})"))
+            (
+                Box::new(GoalBlock::new(x, y, z)),
+                format!("({x}, {y}, {z})"),
+            )
         }
         _ => {
             eprintln!("Usage: baritone <X> <Y> <Z> [--execute]");
@@ -50,7 +50,10 @@ fn main() -> Result<()> {
 
     // Run A* pathfinding.
     let start = Instant::now();
-    println!("Searching for path (max {} nodes)...", SearchConfig::default().max_nodes);
+    println!(
+        "Searching for path (max {} nodes)...",
+        SearchConfig::default().max_nodes
+    );
     let path = path_finder(&world, goal, (sx, sy, sz), &SearchConfig::default());
     let elapsed = start.elapsed();
 
@@ -62,6 +65,13 @@ fn main() -> Result<()> {
                 p.length(),
                 p.num_nodes_considered
             );
+            let (dx, dy, dz) = p.dest();
+            if !p.goal.is_in_goal(dx, dy, dz) {
+                println!(
+                    "Partial path: the goal is out of reach in the loaded chunks \
+                     (node budget or unloaded terrain); this walks toward it."
+                );
+            }
             for (i, pos) in p.positions().iter().enumerate() {
                 let mv = if i < p.movements().len() {
                     format!("{:?}", p.movements()[i])
@@ -74,6 +84,12 @@ fn main() -> Result<()> {
             if execute {
                 println!("\nExecuting path...");
                 execute_path(&world, p)?;
+                let (px, py, pz) = world.player_pos()?;
+                if p.goal.is_in_goal(px, py, pz) {
+                    println!("Goal reached.");
+                } else {
+                    println!("Walked as far as the current path goes; re-run to continue.");
+                }
             }
         }
         None => {

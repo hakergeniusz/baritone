@@ -5,6 +5,11 @@
 //! - `Movement.java` base + `MovementHelper.java` — cost logic
 //! - `MovementTraverse.java`, `MovementAscend.java`, `MovementDescend.java`,
 //!   `MovementFall.java`, `MovementDiagonal.java`, `MovementParkour.java`
+//!
+//! Divergence from baritone: the executor mines with the bare hand (no
+//! tool switching), so breaking costs assume no tool, and movements that
+//! would require *placing* blocks (bridging, pillar jumps) are impassable
+//! (`COST_INF`), where baritone's own executor would bridge through them.
 
 use crate::goals::action_costs;
 use crate::world::LiveWorld;
@@ -147,10 +152,11 @@ impl Moves {
                 mv,
                 Moves::ParkourNorth | Moves::ParkourSouth | Moves::ParkourEast | Moves::ParkourWest
             ) {
-                let (pdx, _pdy, pdz) = static_offset(*mv);
-                let pd = pdx.abs() + pdz.abs();
-                let d = dx.abs() + dz.abs();
-                if d == pd && dy == 0 {
+                // Parkour is a flat axis-aligned jump; match the exact offset
+                // (direction matters — north and south share the same
+                // distance, so only comparing distances mislabels them).
+                let (pdx, pdy, pdz) = static_offset(*mv);
+                if dx == pdx && dy == pdy && dz == pdz {
                     return Some(*mv);
                 }
                 continue;
@@ -212,8 +218,12 @@ pub mod block_tags {
 
     /// Blocks that baritone will never break (e.g. bedrock, barriers).
     pub fn never_break() -> &'static [&'static str] {
-        &["minecraft:bedrock", "minecraft:barrier", "minecraft:command_block",
-          "minecraft:light_blue_stained_glass"]
+        &[
+            "minecraft:bedrock",
+            "minecraft:barrier",
+            "minecraft:command_block",
+            "minecraft:light_blue_stained_glass",
+        ]
     }
 
     /// Check if a block is in the never-break list (after stripping props).
@@ -237,23 +247,29 @@ pub mod block_tags {
         base.ends_with("_leaves") || base == "minecraft:leaves"
     }
 
-    /// Leaf litter and similar ground cover (dirt, grass, sand, etc.).
+    /// Non-solid ground cover plants (no collision box) — passable to walk
+    /// through, but not standable on. Solid terrain (dirt, grass blocks,
+    /// sand, ...) is intentionally NOT here: those are full cubes, so they
+    /// must not be treated as walk-through.
     pub fn is_ground_cover(block: &str) -> bool {
         let base = strip_props(block);
         matches!(
             base,
-            "minecraft:leaf_litter" | "minecraft:coarse_dirt" | "minecraft:rooted_dirt"
-                | "minecraft:podzol" | "minecraft:mycelium" | "minecraft:dirt"
-                | "minecraft:grass_block" | "minecraft:crimson_nyllis" | "minecraft:warped_nylium"
-                | "minecraft:gravel" | "minecraft:sand" | "minecraft:red_sand"
-                | "minecraft:clay" | "minecraft:soul_soil" | "minecraft:muck"
+            "minecraft:leaf_litter"
+                | "minecraft:pink_petals"
+                | "minecraft:short_grass"
+                | "minecraft:fern"
+                | "minecraft:dead_bush"
         )
     }
 
     /// Air blocks.
     pub fn is_air(block: &str) -> bool {
         let base = strip_props(block);
-        matches!(base, "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air")
+        matches!(
+            base,
+            "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+        )
     }
 
     /// Water blocks.
@@ -273,7 +289,10 @@ pub mod block_tags {
         let base = strip_props(block);
         matches!(
             base,
-            "minecraft:fire" | "minecraft:soul_fire" | "minecraft:crimson_fire" | "minecraft:warped_fire"
+            "minecraft:fire"
+                | "minecraft:soul_fire"
+                | "minecraft:crimson_fire"
+                | "minecraft:warped_fire"
         )
     }
 
@@ -338,12 +357,19 @@ pub mod block_tags {
     }
 
     /// Falling blocks (sand, gravel, anvils, etc.) that could suffocate.
+    /// `soul_sand` is deliberately not matched: it only shares the suffix.
     pub fn is_falling_block(block: &str) -> bool {
         let base = strip_props(block);
-        base.ends_with("_sand") || base.ends_with("_gravel")
-            || base == "minecraft:anvil"
-            || base.ends_with("_anvil")
-            || base.ends_with("_cactus") // falling cactus
+        matches!(
+            base,
+            "minecraft:sand"
+                | "minecraft:red_sand"
+                | "minecraft:suspicious_sand"
+                | "minecraft:suspicious_gravel"
+                | "minecraft:anvil"
+                | "minecraft:chipped_anvil"
+                | "minecraft:damaged_anvil"
+        ) || base.ends_with("_gravel")
     }
 }
 
@@ -353,8 +379,14 @@ fn can_walk_through(world: &LiveWorld, x: i32, y: i32, z: i32) -> bool {
     if block_tags::is_air(&block) {
         return true;
     }
-    // Leaves and ground cover are passable (walk-through-able).
-    if block_tags::is_leaves(&block) || block_tags::is_ground_cover(&block) {
+    // Non-solid ground cover plants are passable. Leaves are NOT: they are
+    // full solid cubes, so walking through a canopy would need mining,
+    // which the executor can't do.
+    if block_tags::is_ground_cover(&block) {
+        return true;
+    }
+    // Water is passable (you wade or swim through it).
+    if block_tags::is_water(&block) {
         return true;
     }
     // Doors, fence gates are walk-through when open (assume open for pathing).
@@ -385,8 +417,10 @@ pub fn can_walk_on(world: &LiveWorld, x: i32, y: i32, z: i32) -> bool {
     if block_tags::is_climbable(&block) {
         return true;
     }
+    // Water is not standable (baritone's canWalkOn returns false for water
+    // unless assumeWalkOnWater is set, which defaults to false).
     if block_tags::is_water(&block) {
-        return true; // can walk on water surface (or with frost walker)
+        return false;
     }
     if block_tags::is_magma(&block) {
         return true; // can walk, but takes damage
@@ -395,9 +429,9 @@ pub fn can_walk_on(world: &LiveWorld, x: i32, y: i32, z: i32) -> bool {
     if block_tags::is_leaves(&block) {
         return true;
     }
-    // Ground cover / vegetation like grass, dirt, leaf litter.
+    // Non-solid ground cover plants can't be stood on.
     if block_tags::is_ground_cover(&block) {
-        return true;
+        return false;
     }
     // Solid blocks. We approximate by treating anything with a collision box
     // that's not air/water/lava/fire.
@@ -408,12 +442,6 @@ pub fn can_walk_on(world: &LiveWorld, x: i32, y: i32, z: i32) -> bool {
         && !block_tags::is_web(&block)
         && !block_tags::is_cactus(&block)
         && !block_tags::is_sweet_berry(&block)
-}
-
-/// Whether the block at (x,y,z) is replaceable (can be broken/placed against).
-fn is_replaceable(world: &LiveWorld, x: i32, y: i32, z: i32) -> bool {
-    let block = world.get_block(x, y, z);
-    block_tags::is_air(&block) || block_tags::is_water(&block) || block_tags::is_lava(&block)
 }
 
 // ---------------------------------------------------------------------------
@@ -440,30 +468,59 @@ fn traverse_cost(world: &LiveWorld, x: i32, y: i32, z: i32, dx: i32, dz: i32) ->
             wc = action_costs::WALK_ONE_IN_WATER_COST;
         } else {
             if block_tags::is_soul_sand(&src_down) {
-                wc += (action_costs::WALK_ONE_OVER_SOUL_SAND_COST - action_costs::WALK_ONE_BLOCK_COST) / 2.0;
+                wc += (action_costs::WALK_ONE_OVER_SOUL_SAND_COST
+                    - action_costs::WALK_ONE_BLOCK_COST)
+                    / 2.0;
             }
             if block_tags::is_magma(&dest_on) {
-                wc += (action_costs::SNEAK_ONE_BLOCK_COST - action_costs::WALK_ONE_BLOCK_COST) / 2.0;
+                wc +=
+                    (action_costs::SNEAK_ONE_BLOCK_COST - action_costs::WALK_ONE_BLOCK_COST) / 2.0;
             }
         }
 
-        let hardness1 = mining_cost(&world, dest_x, y, dest_z, &pb1, false);
+        let hardness1 = mining_cost(world, dest_x, y, dest_z, &pb1, false);
         if hardness1 >= action_costs::COST_INF {
-            return MoveResult { x: 0, y: 0, z: 0, cost: action_costs::COST_INF };
+            return MoveResult {
+                x: 0,
+                y: 0,
+                z: 0,
+                cost: action_costs::COST_INF,
+            };
         }
-        let hardness2 = mining_cost(&world, dest_x, y + 1, dest_z, &pb0, true);
+        let hardness2 = mining_cost(world, dest_x, y + 1, dest_z, &pb0, true);
         if hardness1 == 0.0 && hardness2 == 0.0 && !water {
             wc *= action_costs::SPRINT_MULTIPLIER;
-            return MoveResult { x: dest_x, y, z: dest_z, cost: wc };
+            return MoveResult {
+                x: dest_x,
+                y,
+                z: dest_z,
+                cost: wc,
+            };
         }
         if block_tags::is_climbable(&src_down) {
-            return MoveResult { x: 0, y: 0, z: 0, cost: action_costs::COST_INF };
+            return MoveResult {
+                x: 0,
+                y: 0,
+                z: 0,
+                cost: action_costs::COST_INF,
+            };
         }
-        return MoveResult { x: dest_x, y, z: dest_z, cost: wc + hardness1 + hardness2 };
+        return MoveResult {
+            x: dest_x,
+            y,
+            z: dest_z,
+            cost: wc + hardness1 + hardness2,
+        };
     }
 
-    // Can't walk on — need to place a block (bridge). Simplified to COST_INF.
-    MoveResult { x: 0, y: 0, z: 0, cost: action_costs::COST_INF }
+    // Can't walk on — would need to place a block (bridge). The executor
+    // can't place, so this is impassable.
+    MoveResult {
+        x: 0,
+        y: 0,
+        z: 0,
+        cost: action_costs::COST_INF,
+    }
 }
 
 /// Cost to ascend one block (jump up). Ported from `MovementAscend.cost`.
@@ -472,54 +529,66 @@ fn ascend_cost(world: &LiveWorld, x: i32, y: i32, z: i32, dx: i32, dz: i32) -> M
     let dest_z = z + dz;
     let dest_y = y + 1;
 
-    // Must be able to walk through the destination (foot + head level).
-    if !can_walk_through(world, dest_x, dest_y, dest_z) {
-        return MoveResult { x: 0, y: 0, z: 0, cost: action_costs::COST_INF };
-    }
-    if !can_walk_through(world, dest_x, dest_y + 1, dest_z) {
-        return MoveResult { x: 0, y: 0, z: 0, cost: action_costs::COST_INF };
-    }
-
-    // Source headroom must be clear.
-    if !can_walk_through(world, x, y + 2, z) {
-        return MoveResult { x: 0, y: 0, z: 0, cost: action_costs::COST_INF };
-    }
-
-    // Dest must be walk-onto-able (or placeable).
-    if !can_walk_on(world, dest_x, dest_y, dest_z) {
-        let to_place = world.get_block(dest_x, dest_y, dest_z);
-        if !is_replaceable(world, dest_x, dest_y, dest_z) {
-            return MoveResult { x: 0, y: 0, z: 0, cost: action_costs::COST_INF };
-        }
-        let placement_cost = placement_cost(world, dest_x, dest_y, dest_z, &to_place);
-        if placement_cost >= action_costs::COST_INF {
-            return MoveResult { x: 0, y: 0, z: 0, cost: action_costs::COST_INF };
-        }
-        let found = placeable_adjacent(world, dest_x, dest_y, dest_z, x, z);
-        if !found {
-            return MoveResult { x: 0, y: 0, z: 0, cost: action_costs::COST_INF };
-        }
+    // Land on the step block at (dest_x, y, dest_z) — the block *beneath*
+    // the landing position (baritone checks `canWalkOn(destX, src.y, destZ)`).
+    // Baritone falls back to placing a block and jumping onto it when there
+    // is no step; the executor can't place, so that's impassable here.
+    if !can_walk_on(world, dest_x, y, dest_z) {
         return MoveResult {
-            x: dest_x, y: dest_y, z: dest_z,
-            cost: placement_cost + action_costs::WALK_ONE_BLOCK_COST,
+            x: 0,
+            y: 0,
+            z: 0,
+            cost: action_costs::COST_INF,
         };
     }
 
-    // Walkable — standard jump cost.
-    let walk_cost = action_costs::WALK_ONE_BLOCK_COST;
-    let jump_cost = action_costs::jump_one_block_cost();
-    let total = walk_cost + jump_cost;
-
-    // Check for falling blocks above that could suffocate.
-    let above1 = world.get_block(dest_x, dest_y + 1, dest_z);
-    let above2 = world.get_block(dest_x, dest_y + 2, dest_z);
-    if block_tags::is_falling_block(&above2)
+    // Check for falling blocks above the source that could suffocate
+    // (baritone's `srcUp3` falling check).
+    let above1 = world.get_block(x, y + 1, z);
+    if block_tags::is_falling_block(&world.get_block(x, y + 3, z))
         && (can_walk_through(world, x, y + 1, z) || !block_tags::is_falling_block(&above1))
     {
-        return MoveResult { x: 0, y: 0, z: 0, cost: action_costs::COST_INF };
+        return MoveResult {
+            x: 0,
+            y: 0,
+            z: 0,
+            cost: action_costs::COST_INF,
+        };
     }
 
-    MoveResult { x: dest_x, y: dest_y, z: dest_z, cost: total }
+    // Walkable step — standard jump cost (baritone: WALK + JUMP).
+    let walk_cost = action_costs::WALK_ONE_BLOCK_COST;
+    let jump_cost = action_costs::jump_one_block_cost();
+
+    // Landing space and headroom above it, plus the headroom above the
+    // source: baritone mines all three if solid (`MovementAscend.cost` adds
+    // `getMiningDurationTicks` for (x, y+2), (destX, y+1) and (destX, y+2)).
+    let mut cost = walk_cost + jump_cost;
+    for (bx, by, bz, upper) in [
+        (x, y + 2, z, false),
+        (dest_x, dest_y, dest_z, false),
+        (dest_x, dest_y + 1, dest_z, true),
+    ] {
+        let block = world.get_block(bx, by, bz);
+        let mine = mining_cost(world, bx, by, bz, &block, upper);
+        if mine >= action_costs::COST_INF {
+            return MoveResult {
+                x: 0,
+                y: 0,
+                z: 0,
+                cost: action_costs::COST_INF,
+            };
+        }
+        cost += mine;
+    }
+
+    // Walkable step — standard jump cost (baritone: WALK + JUMP).
+    MoveResult {
+        x: dest_x,
+        y: dest_y,
+        z: dest_z,
+        cost,
+    }
 }
 
 /// Cost to descend one block (walk off edge and fall 1 block).
@@ -529,22 +598,70 @@ fn descend_cost(world: &LiveWorld, x: i32, y: i32, z: i32, dx: i32, dz: i32) -> 
     let dest_z = z + dz;
     let dest_y = y - 1;
 
-    // Block below destination must be walkable.
-    if !can_walk_on(world, dest_x, dest_y - 1, dest_z) {
-        // Dynamic fall — could fall through water, etc.
-        return dynamic_fall_cost(world, x, y, z, dest_x, dest_z);
+    // The move passes through the front column at feet and head level (and
+    // one above the head): baritone mines all three (`MovementDescend.cost`
+    // prices (destX, y-1), (destX, y) and (destX, y+1) up front).
+    let mut mining = 0.0;
+    for (bx, by, upper) in [
+        (dest_x, dest_y, false),
+        (dest_x, y, false),
+        (dest_x, y + 1, true),
+    ] {
+        let block = world.get_block(bx, by, dest_z);
+        let mine = mining_cost(world, bx, by, dest_z, &block, upper);
+        if mine >= action_costs::COST_INF {
+            return MoveResult {
+                x: 0,
+                y: 0,
+                z: 0,
+                cost: action_costs::COST_INF,
+            };
+        }
+        mining += mine;
     }
 
-    // Standard 1-block descend: walk off, fall 1, recenter.
+    // Don't descend off a ladder or vine (baritone's `isClimbable(fromDown)`).
+    if block_tags::is_climbable(&world.get_block(x, y - 1, z)) {
+        return MoveResult {
+            x: 0,
+            y: 0,
+            z: 0,
+            cost: action_costs::COST_INF,
+        };
+    }
+
+    // Block two below the destination must be walkable for a standard
+    // descend (feet land at y-1, standing on y-2); otherwise it may be a
+    // dynamic fall into water or a deeper drop.
+    if !can_walk_on(world, dest_x, dest_y - 1, dest_z) {
+        return dynamic_fall_cost(world, x, y, z, dest_x, dest_z, mining);
+    }
+
+    // A ladder in the landing column is the climber's job, not a descend.
+    if block_tags::is_climbable(&world.get_block(dest_x, dest_y, dest_z)) {
+        return MoveResult {
+            x: 0,
+            y: 0,
+            z: 0,
+            cost: action_costs::COST_INF,
+        };
+    }
+
     let walk = action_costs::WALK_OFF_BLOCK_COST;
     let fall = action_costs::fall_n_blocks_cost(1);
     let recenter = action_costs::CENTER_AFTER_FALL_COST;
 
-    MoveResult { x: dest_x, y: dest_y, z: dest_z, cost: walk + fall.max(recenter) }
+    MoveResult {
+        x: dest_x,
+        y: dest_y,
+        z: dest_z,
+        cost: mining + walk + fall.max(recenter),
+    }
 }
 
 /// Dynamic fall cost — falling through air/water to a landing spot.
-/// Ported from `MovementDescend.dynamicFallCost`.
+/// Ported from `MovementDescend.dynamicFallCost`. `front_break` is the
+/// caller's mining cost for the front passage (baritone's `frontBreak`).
 fn dynamic_fall_cost(
     world: &LiveWorld,
     _x: i32,
@@ -552,44 +669,87 @@ fn dynamic_fall_cost(
     _z: i32,
     dest_x: i32,
     dest_z: i32,
+    front_break: f64,
 ) -> MoveResult {
-    let front_block = world.get_block(dest_x, y, dest_z);
-    let front_break = if block_tags::is_air(&front_block) {
-        0.0
-    } else {
-        mining_cost(world, dest_x, y, dest_z, &front_block, false)
-    };
-    let front_break = if front_break >= action_costs::COST_INF { 0.0 } else { front_break };
-
-    let cost_so_far = 0.0;
+    // Breaking blocks in front can shake loose a falling block stacked on
+    // top of the column (baritone's `FallingBlock` guard): don't fall in.
+    if front_break > 0.0 && block_tags::is_falling_block(&world.get_block(dest_x, y + 2, dest_z)) {
+        return MoveResult {
+            x: 0,
+            y: 0,
+            z: 0,
+            cost: action_costs::COST_INF,
+        };
+    }
+    // The fall column's first free-fall block must already be passable —
+    // the caller mines the front passage, not the fall column itself.
+    if !can_walk_through(world, dest_x, y - 2, dest_z) {
+        return MoveResult {
+            x: 0,
+            y: 0,
+            z: 0,
+            cost: action_costs::COST_INF,
+        };
+    }
 
     for fall_height in 3..100 {
         let new_y = y - fall_height;
         if new_y < -64 {
-            return MoveResult { x: 0, y: 0, z: 0, cost: action_costs::COST_INF };
+            return MoveResult {
+                x: 0,
+                y: 0,
+                z: 0,
+                cost: action_costs::COST_INF,
+            };
         }
 
         let onto_block = world.get_block(dest_x, new_y, dest_z);
 
-        // Landing in water.
+        // Landing in water: feet end up in the water block itself.
         if block_tags::is_water(&onto_block) {
             if !can_walk_on(world, dest_x, new_y - 1, dest_z) {
-                return MoveResult { x: 0, y: 0, z: 0, cost: action_costs::COST_INF };
+                return MoveResult {
+                    x: 0,
+                    y: 0,
+                    z: 0,
+                    cost: action_costs::COST_INF,
+                };
             }
             let tentative = action_costs::WALK_OFF_BLOCK_COST
                 + action_costs::fall_n_blocks_cost(fall_height as usize)
-                + front_break
-                + cost_so_far;
-            return MoveResult { x: dest_x, y: new_y, z: dest_z, cost: tentative };
+                + front_break;
+            return MoveResult {
+                x: dest_x,
+                y: new_y,
+                z: dest_z,
+                cost: tentative,
+            };
         }
 
-        // Landing on a solid block.
+        // Landing on a solid block: feet end up standing ON it
+        // (baritone: `res.y = newY + 1` — "the block we're falling onto").
         if can_walk_on(world, dest_x, new_y, dest_z) {
+            // Baritone rejects the move when the unprotected fall exceeds
+            // `maxFallHeightNoWater + 1` (default 3 + 1): deeper drops deal
+            // too much fall damage, and the solid block ends the column —
+            // there is nothing deeper to consider.
+            if fall_height > action_costs::MAX_FALL_HEIGHT_NO_WATER + 1 {
+                return MoveResult {
+                    x: 0,
+                    y: 0,
+                    z: 0,
+                    cost: action_costs::COST_INF,
+                };
+            }
             let tentative = action_costs::WALK_OFF_BLOCK_COST
                 + action_costs::fall_n_blocks_cost(fall_height as usize)
-                + front_break
-                + cost_so_far;
-            return MoveResult { x: dest_x, y: new_y, z: dest_z, cost: tentative };
+                + front_break;
+            return MoveResult {
+                x: dest_x,
+                y: new_y + 1,
+                z: dest_z,
+                cost: tentative,
+            };
         }
 
         // Still falling — if block is solid, we can't continue.
@@ -598,7 +758,12 @@ fn dynamic_fall_cost(
         }
     }
 
-    MoveResult { x: 0, y: 0, z: 0, cost: action_costs::COST_INF }
+    MoveResult {
+        x: 0,
+        y: 0,
+        z: 0,
+        cost: action_costs::COST_INF,
+    }
 }
 
 /// Cost for diagonal movement (including ascend/descend on the diagonal).
@@ -606,104 +771,551 @@ fn dynamic_fall_cost(
 fn diagonal_cost(world: &LiveWorld, x: i32, y: i32, z: i32, dx: i32, dz: i32) -> MoveResult {
     let dest_x = x + dx;
     let dest_z = z + dz;
+    let inf = MoveResult {
+        x: 0,
+        y: 0,
+        z: 0,
+        cost: action_costs::COST_INF,
+    };
 
-    let diag_base = action_costs::WALK_ONE_BLOCK_COST * 0.7071067811865476; // sqrt(2)/2 scaling
+    let diag_base = action_costs::WALK_ONE_BLOCK_COST * std::f64::consts::FRAC_1_SQRT_2;
+
+    // Corner analysis (baritone MovementDiagonal): the move needs at most
+    // one of the two corner columns cleared — baritone mines the other one,
+    // we can't, so at least one column must be fully passable already.
+    // Also never cut a corner over lava (baritone checks the same).
+    let a_clear =
+        can_walk_through(world, x, y, z + dz) && can_walk_through(world, x, y + 1, z + dz);
+    let b_clear =
+        can_walk_through(world, x + dx, y, z) && can_walk_through(world, x + dx, y + 1, z);
+    if (!a_clear && !b_clear)
+        || block_tags::is_lava(&world.get_block(x, y - 1, z + dz))
+        || block_tags::is_lava(&world.get_block(x + dx, y - 1, z))
+    {
+        return inf;
+    }
 
     if !can_walk_through(world, dest_x, y, dest_z) {
-        // Could be an ascend on diagonal.
-        if !can_walk_through(world, x, y + 2, z) {
-            return MoveResult { x: 0, y: 0, z: 0, cost: action_costs::COST_INF };
+        // Diagonal ascend: land on the step block at (dest_x, y, dest_z).
+        // Baritone additionally requires one corner column clear all the
+        // way up past the head (otherwise the jump bonks).
+        let a_top = can_walk_through(world, x, y + 2, z + dz);
+        let b_top = can_walk_through(world, x + dx, y + 2, z);
+        if !can_walk_through(world, x, y + 2, z) || !(a_clear && a_top || b_clear && b_top) {
+            return inf;
         }
-        if can_walk_on(world, dest_x, y, dest_z) && can_walk_through(world, dest_x, y + 1, dest_z) {
+        if can_walk_on(world, dest_x, y, dest_z)
+            && can_walk_through(world, dest_x, y + 1, dest_z)
+            && can_walk_through(world, dest_x, y + 2, dest_z)
+        {
             return MoveResult {
-                x: dest_x, y: y + 1, z: dest_z,
+                x: dest_x,
+                y: y + 1,
+                z: dest_z,
                 cost: diag_base + action_costs::jump_one_block_cost(),
             };
         }
-        return MoveResult { x: 0, y: 0, z: 0, cost: action_costs::COST_INF };
+        return inf;
     }
 
     // Flat diagonal.
     if can_walk_on(world, dest_x, y - 1, dest_z) && can_walk_through(world, dest_x, y + 1, dest_z) {
-        return MoveResult { x: dest_x, y, z: dest_z, cost: diag_base };
+        return MoveResult {
+            x: dest_x,
+            y,
+            z: dest_z,
+            cost: diag_base,
+        };
     }
 
-    // Descending diagonal.
-    if can_walk_on(world, dest_x, y - 2, dest_z) {
+    // Descending diagonal: the dropped-into space must be enterable.
+    if can_walk_through(world, dest_x, y - 1, dest_z) && can_walk_on(world, dest_x, y - 2, dest_z) {
         return MoveResult {
-            x: dest_x, y: y - 1, z: dest_z,
+            x: dest_x,
+            y: y - 1,
+            z: dest_z,
             cost: action_costs::WALK_OFF_BLOCK_COST + action_costs::fall_n_blocks_cost(1),
         };
     }
 
-    MoveResult { x: 0, y: 0, z: 0, cost: action_costs::COST_INF }
+    inf
 }
 
 /// Cost for a 4-block sprint jump (parkour) over a gap.
-/// Ported conceptually from `MovementParkour.cost`.
-fn parkour_cost(world: &LiveWorld, x: i32, y: i32, z: i32, dx: i32, dz: i32, _dir: Direction) -> MoveResult {
-    let dest_x = x + dx;
-    let dest_z = z + dz;
+/// Ported conceptually from `MovementParkour.cost` (fixed 4-block distance).
+///
+/// `dx`/`dz` are a unit direction; the landing is [`PARKOUR_DIST`] blocks out
+/// (the takeoff edge clears three gap columns onto the fourth block, matching
+/// `Moves::from_delta`'s (±4, 0) offsets).
+const PARKOUR_DIST: i32 = 4;
 
-    // Check the gap is air for 4 blocks.
+fn parkour_cost(
+    world: &LiveWorld,
+    x: i32,
+    y: i32,
+    z: i32,
+    dx: i32,
+    dz: i32,
+    _dir: Direction,
+) -> MoveResult {
+    let dest_x = x + dx * PARKOUR_DIST;
+    let dest_z = z + dz * PARKOUR_DIST;
+    let inf = MoveResult {
+        x: 0,
+        y: 0,
+        z: 0,
+        cost: action_costs::COST_INF,
+    };
+
+    // Can't jump out of water, and jumping off a climbable block doesn't work.
+    if block_tags::is_water(&world.get_block(x, y, z))
+        || block_tags::is_climbable(&world.get_block(x, y - 1, z))
+    {
+        return inf;
+    }
+    // Headroom above the takeoff point.
+    if !can_walk_through(world, x, y + 2, z) {
+        return inf;
+    }
+    // The adjacent block must be passable at feet and head level...
+    if !can_walk_through(world, x + dx, y, z + dz)
+        || !can_walk_through(world, x + dx, y + 1, z + dz)
+    {
+        return inf;
+    }
+    // ...and if we could just walk onto the adjacent floor, don't jump
+    // (baritone: "don't parkour if we could just traverse").
+    if can_walk_on(world, x + dx, y - 1, z + dz) {
+        return inf;
+    }
+
+    // The gap columns between takeoff and landing must be passable at feet
+    // and head level. These are the *intermediate* columns — the old code
+    // checked the takeoff/landing columns here instead, so north/south
+    // gaps went entirely unverified.
     for step in 1..=3 {
         let bx = x + dx * step;
-        let _bz = z + dz * step;
-        if !can_walk_through(world, bx, y, dest_z) && !can_walk_through(world, bx, y, z) {
-            return MoveResult { x: 0, y: 0, z: 0, cost: action_costs::COST_INF };
+        let bz = z + dz * step;
+        if !can_walk_through(world, bx, y, bz) || !can_walk_through(world, bx, y + 1, bz) {
+            return inf;
         }
     }
 
+    // Landing floor must be walkable; landing is at the same Y (flat jump).
     if !can_walk_on(world, dest_x, y - 1, dest_z) {
-        return MoveResult { x: 0, y: 0, z: 0, cost: action_costs::COST_INF };
+        return inf;
+    }
+
+    // Overshoot safety: the two blocks past the landing must be enterable
+    // (baritone's checkOvershootSafety — don't jump into a wall or lava).
+    if !can_walk_through(world, dest_x + dx, y, dest_z + dz)
+        || !can_walk_through(world, dest_x + dx, y + 1, dest_z + dz)
+    {
+        return inf;
     }
 
     let cost = action_costs::SPRINT_ONE_BLOCK_COST * 4.0 + action_costs::jump_one_block_cost();
-    MoveResult { x: dest_x, y: y - 1, z: dest_z, cost }
+    MoveResult {
+        x: dest_x,
+        y,
+        z: dest_z,
+        cost,
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Mining / placement cost helpers
+// Mining cost helper
 // ---------------------------------------------------------------------------
 
-/// Estimate the cost (in ticks) to break a block.
-/// Simplified from `MovementHelper.getMiningDurationTicks`.
-fn mining_cost(_world: &LiveWorld, _x: i32, _y: i32, _z: i32, block: &str, _is_upper: bool) -> f64 {
-    if block_tags::is_air(block) {
+/// Block hardness data and hand-mining times.
+///
+/// Ported from baritone's cost model (`MovementHelper.getMiningDurationTicks`
+/// over a `ToolSet` with no tools): Minecraft breaks a block in
+/// `hardness × 30` ticks when the hand can harvest it and
+/// `hardness × 100` when a tool is required, and cannot break blocks of
+/// hardness < 0 at all. Horizon's own mining loop uses the same formula
+/// (`progress = speed / hardness / (30 if harvest else 100)`), so these
+/// times match what the executor will actually experience.
+pub mod hardness {
+    use super::action_costs::COST_INF;
+
+    /// (hardness, requires_correct_tool) for the blocks worth naming.
+    /// Vanilla values; suffix rules below cover whole material families.
+    /// Accepts bare and `minecraft:`-prefixed names.
+    fn entry(base: &str) -> Option<(f64, bool)> {
+        let name = base.strip_prefix("minecraft:").unwrap_or(base);
+        let table: &[(&str, f64, bool)] = &[
+            // unbreakable (hardness < 0: the hand cannot break them)
+            ("bedrock", -1.0, true),
+            ("barrier", -1.0, true),
+            ("command_block", -1.0, true),
+            ("chain_command_block", -1.0, true),
+            ("repeating_command_block", -1.0, true),
+            ("end_portal", -1.0, true),
+            ("end_portal_frame", -1.0, true),
+            ("end_gateway", -1.0, true),
+            ("nether_portal", -1.0, true),
+            // stone family
+            ("stone", 1.5, true),
+            ("cobblestone", 2.0, true),
+            ("mossy_cobblestone", 2.0, true),
+            ("smooth_stone", 2.0, true),
+            ("stone_bricks", 1.5, true),
+            ("mossy_stone_bricks", 1.5, true),
+            ("cracked_stone_bricks", 1.5, true),
+            ("chiseled_stone_bricks", 1.5, true),
+            ("granite", 1.5, true),
+            ("diorite", 1.5, true),
+            ("andesite", 1.5, true),
+            ("deepslate", 3.0, true),
+            ("cobbled_deepslate", 3.5, true),
+            ("polished_deepslate", 3.5, true),
+            ("deepslate_bricks", 3.5, true),
+            ("deepslate_tiles", 3.5, true),
+            ("tuff", 1.5, true),
+            ("calcite", 0.75, true),
+            ("dripstone_block", 1.5, true),
+            ("basalt", 1.25, true),
+            ("blackstone", 1.5, true),
+            ("obsidian", 50.0, true),
+            ("crying_obsidian", 50.0, true),
+            ("netherrack", 0.4, true),
+            ("nether_bricks", 2.0, true),
+            ("red_nether_bricks", 2.0, true),
+            ("end_stone", 3.0, true),
+            ("end_stone_bricks", 3.0, true),
+            ("purpur_block", 1.5, true),
+            ("quartz_block", 0.8, true),
+            ("quartz_bricks", 0.8, true),
+            ("amethyst_block", 1.5, true),
+            ("budding_amethyst", 1.5, true),
+            ("sandstone", 0.8, true),
+            ("red_sandstone", 0.8, true),
+            ("terracotta", 1.25, true),
+            ("bricks", 2.0, true),
+            ("mud_bricks", 1.5, true),
+            ("packed_mud", 1.0, false),
+            ("mud", 0.5, false),
+            ("clay", 0.6, false),
+            // soft terrain
+            ("dirt", 0.5, false),
+            ("coarse_dirt", 0.5, false),
+            ("rooted_dirt", 0.5, false),
+            ("grass_block", 0.6, false),
+            ("podzol", 0.6, false),
+            ("mycelium", 0.6, false),
+            ("dirt_path", 0.65, false),
+            ("farmland", 0.6, false),
+            ("sand", 0.5, false),
+            ("red_sand", 0.5, false),
+            ("gravel", 0.6, false),
+            ("soul_sand", 0.5, false),
+            ("soul_soil", 0.5, false),
+            ("snow_block", 0.2, true),
+            ("moss_block", 0.1, false),
+            ("sponge", 0.6, false),
+            ("wet_sponge", 0.6, false),
+            ("hay_block", 0.5, false),
+            ("dried_kelp_block", 0.5, false),
+            // wood
+            ("oak_log", 2.0, false),
+            ("spruce_log", 2.0, false),
+            ("birch_log", 2.0, false),
+            ("jungle_log", 2.0, false),
+            ("acacia_log", 2.0, false),
+            ("dark_oak_log", 2.0, false),
+            ("mangrove_log", 2.0, false),
+            ("cherry_log", 2.0, false),
+            ("pale_oak_log", 2.0, false),
+            ("crimson_stem", 2.0, false),
+            ("warped_stem", 2.0, false),
+            ("bamboo_block", 2.0, false),
+            ("bookshelf", 1.5, false),
+            ("chiseled_bookshelf", 1.5, false),
+            ("crafting_table", 2.5, false),
+            ("chest", 2.5, false),
+            ("trapped_chest", 2.5, false),
+            ("barrel", 2.5, false),
+            ("lectern", 2.5, false),
+            ("jukebox", 2.0, false),
+            ("note_block", 0.8, false),
+            ("loom", 2.5, false),
+            ("cartography_table", 2.5, false),
+            ("fletching_table", 2.5, false),
+            ("smithing_table", 2.5, false),
+            ("composter", 0.6, false),
+            // ores and metal blocks
+            ("coal_ore", 3.0, true),
+            ("iron_ore", 3.0, true),
+            ("copper_ore", 3.0, true),
+            ("gold_ore", 3.0, true),
+            ("redstone_ore", 3.0, true),
+            ("lapis_ore", 3.0, true),
+            ("diamond_ore", 3.0, true),
+            ("emerald_ore", 3.0, true),
+            ("deepslate_coal_ore", 4.5, true),
+            ("deepslate_iron_ore", 4.5, true),
+            ("deepslate_copper_ore", 4.5, true),
+            ("deepslate_gold_ore", 4.5, true),
+            ("deepslate_redstone_ore", 4.5, true),
+            ("deepslate_lapis_ore", 4.5, true),
+            ("deepslate_diamond_ore", 4.5, true),
+            ("deepslate_emerald_ore", 4.5, true),
+            ("nether_gold_ore", 3.0, true),
+            ("nether_quartz_ore", 3.0, true),
+            ("ancient_debris", 30.0, true),
+            ("iron_block", 5.0, true),
+            ("gold_block", 3.0, true),
+            ("diamond_block", 5.0, true),
+            ("emerald_block", 5.0, true),
+            ("copper_block", 3.0, true),
+            ("netherite_block", 50.0, true),
+            ("raw_iron_block", 5.0, true),
+            ("raw_gold_block", 5.0, true),
+            ("raw_copper_block", 5.0, true),
+            // misc
+            ("glass", 0.3, false),
+            ("glowstone", 0.3, false),
+            ("sea_lantern", 0.2, false),
+            ("shroomlight", 1.0, false),
+            ("pumpkin", 1.0, false),
+            ("carved_pumpkin", 1.0, false),
+            ("jack_o_lantern", 1.0, false),
+            ("melon", 1.0, false),
+            ("cobweb", 4.0, true),
+            ("cactus", 0.4, false),
+            ("sweet_berry_bush", 0.0, false),
+            ("fire", 0.0, false),
+            ("soul_fire", 0.0, false),
+            ("torch", 0.0, false),
+            ("wall_torch", 0.0, false),
+            ("soul_torch", 0.0, false),
+            ("ladder", 0.4, false),
+            ("rail", 0.7, false),
+            ("powered_rail", 0.7, false),
+            ("detector_rail", 0.7, false),
+            ("activator_rail", 0.7, false),
+            ("lantern", 3.5, true),
+            ("soul_lantern", 3.5, true),
+            ("iron_bars", 5.0, true),
+            ("chain", 5.0, true),
+            ("iron_door", 5.0, true),
+            ("shulker_box", 2.0, true),
+            ("bed", 0.2, false),
+            ("cake", 0.5, false),
+            ("turtle_egg", 0.5, false),
+            ("scaffolding", 0.0, false),
+            ("mangrove_roots", 0.7, false),
+            ("azalea", 0.2, false),
+            ("flowering_azalea", 0.2, false),
+            ("vine", 0.2, false),
+            ("glow_lichen", 0.2, false),
+            ("sugar_cane", 0.0, false),
+            ("bamboo", 1.0, false),
+            ("cocoa", 0.2, false),
+            ("nether_wart", 0.0, false),
+            ("wheat", 0.0, false),
+            ("carrots", 0.0, false),
+            ("potatoes", 0.0, false),
+            ("beetroots", 0.0, false),
+        ];
+        for (n, h, tool) in table {
+            if *n == name {
+                return Some((*h, *tool));
+            }
+        }
+        // Family fallbacks, widest suffix first.
+        let suffixes: &[(&str, f64, bool)] = &[
+            ("_glazed_terracotta", 1.4, true),
+            ("_concrete_powder", 0.5, false),
+            ("_concrete", 1.8, true),
+            ("_shulker_box", 2.0, true),
+            ("_hanging_sign", 1.5, false),
+            ("_pressure_plate", 0.5, false),
+            ("_fence_gate", 2.0, false),
+            ("_trapdoor", 3.0, false),
+            ("_sandstone", 0.8, true),
+            ("_terracotta", 1.25, true),
+            ("_bricks", 2.0, true),
+            ("_planks", 2.0, false),
+            ("_leaves", 0.2, false),
+            ("_log", 2.0, false),
+            ("_wood", 2.0, false),
+            ("_stem", 2.0, false),
+            ("_hyphae", 2.0, false),
+            ("_carpet", 0.1, false),
+            ("_wool", 0.8, false),
+            ("_glass", 0.3, false),
+            ("_ore", 3.0, true),
+            ("_anvil", 5.0, true),
+            ("_door", 3.0, false),
+            ("_fence", 2.0, false),
+            ("_stairs", 2.0, true),
+            ("_slab", 2.0, true),
+            ("_sign", 1.5, false),
+            ("_banner", 1.0, false),
+            ("_torch", 0.0, false),
+            ("_rail", 0.7, false),
+            ("_button", 0.5, false),
+            ("_bed", 0.2, false),
+        ];
+        for (suffix, h, tool) in suffixes {
+            if name.ends_with(suffix) {
+                let h = if *suffix == "_ore" && name.starts_with("deepslate_") {
+                    4.5
+                } else {
+                    *h
+                };
+                return Some((h, *tool));
+            }
+        }
+        // Unknown block: assume stone-like (conservative for planning).
+        Some((1.5, true))
+    }
+
+    /// Ticks to break a block bare-handed: `COST_INF` for unbreakables
+    /// (hardness < 0), 0 for instant blocks, else hardness × 30/100.
+    pub fn break_ticks(base: &str) -> f64 {
+        let (h, tool) = match entry(base) {
+            Some(e) => e,
+            None => return COST_INF,
+        };
+        if h < 0.0 {
+            COST_INF
+        } else if h == 0.0 {
+            0.0
+        } else {
+            h * if tool { 100.0 } else { 30.0 }
+        }
+    }
+
+    /// Ticks the planner prices a break at. Divergence from the bare-hand
+    /// reality of [`break_ticks`], mirroring baritone's own assumption that
+    /// a suitable tool will be used: tool-required blocks (stone, ores)
+    /// are priced at harvest speed (hardness × 30) rather than the hand's
+    /// hardness × 100. Without this, digging toward a buried goal pays more
+    /// per step than the partial-path metric can ever recover and the
+    /// planner refuses to tunnel at all, where baritone plans straight
+    /// through. The executor still breaks at hand speed; mining stints
+    /// time out against [`break_ticks`], so only the ETA is optimistic.
+    pub fn planner_break_ticks(base: &str) -> f64 {
+        let (h, _) = match entry(base) {
+            Some(e) => e,
+            None => return COST_INF,
+        };
+        if h < 0.0 {
+            COST_INF
+        } else if h == 0.0 {
+            0.0
+        } else {
+            h * 30.0
+        }
+    }
+}
+
+/// Cost of a movement entering the block `block` (in ticks). Ported from
+/// `MovementHelper.getMiningDurationTicks`: 0 when the block can be walked
+/// through as-is, the hand-mining time when it must be broken first, and
+/// `COST_INF` when breaking is forbidden.
+///
+/// `is_upper` is baritone's `includeFalling`: on the upper block of a
+/// movement's break set, a stack of falling blocks above joins the cost.
+fn mining_cost(world: &LiveWorld, x: i32, y: i32, z: i32, block: &str, is_upper: bool) -> f64 {
+    if block_tags::is_air(block)
+        || block_tags::is_water(block)
+        || block_tags::is_ground_cover(block)
+        || block_tags::is_climbable(block)
+        || block_tags::is_fence_gate(block)
+        || block_tags::is_wooden_door(block)
+    {
         return 0.0;
     }
-    if block_tags::is_never_break(block) {
+    let base = block_tags::strip_props(block);
+    // Never break, ice (it becomes water), or infested blocks (silverfish).
+    if block_tags::is_never_break(block)
+        || base == "minecraft:ice"
+        || base.starts_with("minecraft:infested_")
+        || block_tags::is_lava(block)
+    {
         return action_costs::COST_INF;
     }
-    // Simple approximation: 1 tick to break, 0 if air.
-    1.0
-}
-
-/// Cost to place a block (placeholder — full implementation needs inventory info).
-fn placement_cost(_world: &LiveWorld, _x: i32, _y: i32, _z: i32, _block: &str) -> f64 {
-    action_costs::WALK_ONE_BLOCK_COST * 0.5
-}
-
-/// Check if there's a solid adjacent block to place against.
-fn placeable_adjacent(world: &LiveWorld, x: i32, y: i32, z: i32, src_x: i32, src_z: i32) -> bool {
-    const DIRS: [(i32, i32, i32); 5] = [
-        (0, 1, 0),
-        (1, 0, 0),
-        (-1, 0, 0),
-        (0, 0, 1),
-        (0, 0, -1),
-    ];
-    for (dx, dy, dz) in DIRS {
-        let ax = x + dx;
-        let ay = y + dy;
-        let az = z + dz;
-        if ax == src_x && ay == y && az == src_z {
-            continue;
+    // Baritone's `avoidBreaking`: don't break next to a liquid (it floods
+    // the path) or beside an unsupported falling block (it collapses
+    // weirdly). The block directly above is exempt from the falling rule —
+    // its cost is added via `includeFalling` instead.
+    for (nx, ny, nz, above) in [
+        (x, y + 1, z, true),
+        (x + 1, y, z, false),
+        (x - 1, y, z, false),
+        (x, y, z + 1, false),
+        (x, y, z - 1, false),
+    ] {
+        let nb = world.get_block(nx, ny, nz);
+        if block_tags::is_water(&nb) || block_tags::is_lava(&nb) {
+            return action_costs::COST_INF;
         }
-        let block = world.get_block(ax, ay, az);
-        if !block_tags::is_air(&block) && !block_tags::is_water(&block) && !block_tags::is_lava(&block) {
-            return true;
+        if !above && block_tags::is_falling_block(&nb) {
+            let under = world.get_block(nx, ny - 1, nz);
+            if block_tags::is_air(&under) || block_tags::is_water(&under) {
+                return action_costs::COST_INF;
+            }
         }
     }
-    false
+    let mut ticks = hardness::planner_break_ticks(base);
+    if is_upper {
+        // A falling block resting on this one drops when it breaks: mine
+        // the whole supported stack above (baritone's recursion).
+        let mut ay = y + 1;
+        for _ in 0..16 {
+            let ab = world.get_block(x, ay, z);
+            if !block_tags::is_falling_block(&ab) {
+                break;
+            }
+            ticks += hardness::break_ticks(block_tags::strip_props(&ab));
+            ay += 1;
+        }
+    }
+    ticks
+}
+
+/// The blocks a movement would break when taken from (x, y, z): exactly the
+/// positions `mining_cost` prices above zero, in baritone's order. The path
+/// stores these per step so the executor can mine before walking.
+pub fn movement_breaks(mv: Moves, world: &LiveWorld, x: i32, y: i32, z: i32) -> Vec<(i32, i32, i32)> {
+    let (dx, dz) = match mv {
+        Moves::TraverseNorth | Moves::AscendNorth | Moves::DescendNorth => (0, -1),
+        Moves::TraverseSouth | Moves::AscendSouth | Moves::DescendSouth => (0, 1),
+        Moves::TraverseEast | Moves::AscendEast | Moves::DescendEast => (1, 0),
+        Moves::TraverseWest | Moves::AscendWest | Moves::DescendWest => (-1, 0),
+        // Diagonals edge through a clear corner without mining; parkour
+        // jumps clear the gap. Neither breaks anything.
+        _ => return Vec::new(),
+    };
+    let dest_x = x + dx;
+    let dest_z = z + dz;
+    let price = |out: &mut Vec<(i32, i32, i32)>, bx: i32, by: i32, bz: i32, upper: bool| {
+        let block = world.get_block(bx, by, bz);
+        if mining_cost(world, bx, by, bz, &block, upper) > 0.0 {
+            out.push((bx, by, bz));
+        }
+    };
+    let mut out = Vec::new();
+    match mv {
+        Moves::TraverseNorth | Moves::TraverseSouth | Moves::TraverseEast | Moves::TraverseWest => {
+            price(&mut out, dest_x, y, dest_z, false);
+            price(&mut out, dest_x, y + 1, dest_z, true);
+        }
+        Moves::AscendNorth | Moves::AscendSouth | Moves::AscendEast | Moves::AscendWest => {
+            price(&mut out, x, y + 2, z, false);
+            price(&mut out, dest_x, y + 1, dest_z, false);
+            price(&mut out, dest_x, y + 2, dest_z, true);
+        }
+        Moves::DescendNorth | Moves::DescendSouth | Moves::DescendEast | Moves::DescendWest => {
+            price(&mut out, dest_x, y - 1, dest_z, false);
+            price(&mut out, dest_x, y, dest_z, false);
+            price(&mut out, dest_x, y + 1, dest_z, true);
+        }
+        _ => {}
+    }
+    out
 }

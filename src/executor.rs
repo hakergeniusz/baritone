@@ -1,21 +1,30 @@
 //! Path execution — sends movement commands to Horizon via its control socket.
 //!
 //! Ported conceptually from baritone's `PathExecutor.java`, adapted to
-//! Horizon's control-socket protocol. Instead of directly manipulating
-//! Minecraft's input system (which baritone does via `Input`, `RotationUtils`,
-//! etc.), we translate each `[Path, PathNode]` segment into a socket command:
+//! Horizon's control-socket protocol. Baritone's executor drives the game's
+//! input system directly and can mine or place blocks mid-path; this port
+//! instead delegates micro-steering to Horizon's own `goto` command, which
+//! walks but cannot mine or place. The planner reflects that: movements
+//! that would need mining or placing are impassable (`COST_INF`), so every
+//! planned path is walk-only.
 //!
-//! - `goto X Y Z` for straightforward walks (Horizon's own A* handles the
-//!   micro-steering).
-//! - For block breaking/placing, we use `break` and `place` directly.
+//! Each run of simple steps (walk or 1-block ascend/descend) becomes one
+//! `goto X Y Z --near R` command; non-simple steps (e.g. parkour jumps) get
+//! one goto aimed at their landing block. After each segment the player's
+//! actual position is checked against the intended one, so drift (Horizon
+//! taking a different route, or stopping early) fails loudly instead of
+//! cascading through the rest of the path.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Context, Result, anyhow};
 use std::io::{Read, Write};
-use std::path::Path as SocketPath;
 use std::os::unix::net::UnixStream;
+use std::path::Path as SocketPath;
 
 use crate::pathing::Path;
 use crate::world::LiveWorld;
+
+/// Maximum allowed block-coordinate error after a goto segment.
+const DRIFT_TOLERANCE: i32 = 2;
 
 /// Execute a path by sending commands to the Horizon control socket.
 pub fn execute_path(world: &LiveWorld, path: &Path) -> Result<()> {
@@ -32,53 +41,71 @@ pub fn execute_path(world: &LiveWorld, path: &Path) -> Result<()> {
     while idx < positions.len().saturating_sub(1) {
         let target = positions[idx];
         let next = positions[idx + 1];
-        let dx = next.0 - target.0;
-        let dy = next.1 - target.1;
-        let dz = next.2 - target.2;
+        let (dx, dy, dz) = (next.0 - target.0, next.1 - target.1, next.2 - target.2);
 
-        if is_simple_step(dx, dy, dz) {
-            // Find the end of the run of simple steps.
+        // For a run of simple steps, send one goto for the whole run;
+        // otherwise aim at the single non-simple step's landing block.
+        let (dest, next_idx) = if is_simple_step(dx, dy, dz) {
             let mut run_end = idx + 1;
             while run_end < positions.len() - 1 {
                 let p0 = positions[run_end];
                 let p1 = positions[run_end + 1];
-                let ddx = p1.0 - p0.0;
-                let ddy = p1.1 - p0.1;
-                let ddz = p1.2 - p0.2;
-                if !is_simple_step(ddx, ddy, ddz) {
+                if !is_simple_step(p1.0 - p0.0, p1.1 - p0.1, p1.2 - p0.2) {
                     break;
                 }
                 run_end += 1;
             }
+            (positions[run_end], run_end + 1)
+        } else {
+            (next, idx + 1)
+        };
+        // Ascents need to land precisely on top of the block, so keep the
+        // tolerance tight there; walks and drops can stop a bit short.
+        let near = if is_simple_step(dx, dy, dz) && dy > 0 {
+            1.0
+        } else {
+            1.5
+        };
 
-            let dest = positions[run_end];
-            let near = if dy <= 0 { 1.5 } else { 1.0 };
-            println!("  goto ({}, {}, {}) near {}", dest.0, dest.1, dest.2, near);
-            let resp = ctl(socket, &[
+        println!("  goto ({}, {}, {}) near {}", dest.0, dest.1, dest.2, near);
+        let resp = ctl(
+            socket,
+            &[
                 "goto",
                 &dest.0.to_string(),
                 &dest.1.to_string(),
                 &dest.2.to_string(),
                 "--near",
                 &near.to_string(),
-            ])?;
-            println!("  response: {}", resp.trim());
-            idx = run_end + 1;
-        } else {
-            // Non-simple step — handle manually (e.g. block placement/breaking).
-            let dest = next;
-            println!("  goto ({}, {}, {})", dest.0, dest.1, dest.2);
-            let resp = ctl(socket, &[
-                "goto",
-                &dest.0.to_string(),
-                &dest.1.to_string(),
-                &dest.2.to_string(),
-                "--near",
-                "1.5",
-            ])?;
-            println!("  response: {}", resp.trim());
-            idx += 1;
+            ],
+        )
+        .with_context(|| format!("goto to ({}, {}, {}) failed", dest.0, dest.1, dest.2))?;
+        println!("  response: {}", resp.trim());
+
+        // Verify we actually arrived: Horizon's goto may report success via
+        // a very different route, or stop short of the target.
+        let (px, py, pz) = world
+            .player_pos()
+            .context("failed to read player position after goto segment")?;
+        let drift = (px - dest.0)
+            .abs()
+            .max((py - dest.1).abs().max((pz - dest.2).abs()));
+        if drift > DRIFT_TOLERANCE {
+            return Err(anyhow!(
+                "path execution aborted: after goto to ({}, {}, {}) the player is at \
+                 ({}, {}, {}) — drifted {} blocks (max {})",
+                dest.0,
+                dest.1,
+                dest.2,
+                px,
+                py,
+                pz,
+                drift,
+                DRIFT_TOLERANCE
+            ));
         }
+
+        idx = next_idx;
     }
 
     println!("Path execution complete.");
@@ -101,7 +128,7 @@ fn ctl(socket_path: &SocketPath, args: &[&str]) -> Result<String> {
 
     let cmd = args.join(" ");
     let mut sock = sock;
-    write!(sock, "{}\n", cmd)?;
+    writeln!(sock, "{}", cmd)?;
     let _ = sock.shutdown(std::net::Shutdown::Write);
 
     let mut buf = Vec::new();
