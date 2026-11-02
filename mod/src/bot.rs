@@ -29,19 +29,21 @@ use super::search::{Path, SearchConfig, path_finder};
 use super::world_view::LiveWorld;
 
 pub const ID: &str = "baritone";
-pub const VERSION: &str = "1.2.0";
+pub const VERSION: &str = "1.3.0";
 pub const DESCRIPTION: &str =
     "Pathfinding bot: walk, sprint, swim, jump and dig to any goal; /mine ores. Ported from Baritone.";
 
 /// Chat commands the mod claims, without their slash.
 const COMMANDS: &[&str] = &[
-    "goto", "near", "path", "stop", "cancel", "help", "mine", "tunnel", "status", "eta",
+    "goto", "near", "path", "stop", "cancel", "help", "mine", "tunnel", "status", "eta", "follow",
 ];
 
 /// The same commands for the server's command tree (`NativeCommand`), one
 /// usage each in the game's `<name:kind>` shape. `help` and `stop` are
 /// vanilla's on the server and left out there — the client-side hook still
-/// answers both, and `/cancel` does `/stop`'s work.
+/// answers both, and `/cancel` does `/stop`'s work. `follow`'s selectors
+/// are separate literal branches, not one `<players|entities|...>` word —
+/// the pipe-bearing node name never made it into the server's grammar.
 const COMMAND_USAGES: &[&str] = &[
     "goto <pos:block_pos>",
     "near [radius:integer]",
@@ -51,6 +53,10 @@ const COMMAND_USAGES: &[&str] = &[
     "eta",
     "mine <block:word> [radius:integer]",
     "tunnel [length:integer]",
+    "follow players",
+    "follow entities",
+    "follow player <name:word>",
+    "follow entity <kind:word>",
 ];
 
 /// Node budget per planning run. The search runs on the game's main thread
@@ -158,11 +164,53 @@ impl GoalSpec {
 }
 
 /// What the bot is out to do. A goto keeps its fixed goal; a mine keeps a
-/// live queue of block positions.
+/// live queue of block positions; a follow re-targets a nearby entity
+/// every tick (baritone's `FollowProcess`).
 enum Mission {
     Goto(GoalSpec),
     Mine(MineMission),
+    Follow(FollowSelector),
 }
+
+/// Which entities `/follow` heads for (baritone's `FollowCommand` groups).
+#[derive(Clone, Debug, PartialEq)]
+pub enum FollowSelector {
+    /// Any other player.
+    Players,
+    /// Anything alive that is not us.
+    Entities,
+    /// A player by nametag.
+    Player(String),
+    /// An entity type (`zombie`, `cow`, `minecraft:zombie`).
+    EntityKind(String),
+}
+
+impl FollowSelector {
+    fn describe(&self) -> String {
+        match self {
+            FollowSelector::Players => "players".to_string(),
+            FollowSelector::Entities => "entities".to_string(),
+            FollowSelector::Player(name) => format!("player {name}"),
+            FollowSelector::EntityKind(kind) => format!("{kind}"),
+        }
+    }
+}
+
+/// One nearby entity as the game reports it, for `/follow`.
+#[derive(Clone, Debug)]
+pub struct EntityInfo {
+    pub id: u32,
+    /// The entity type id without the `minecraft:` prefix (`player`,
+    /// `zombie`).
+    pub kind: String,
+    /// The nametag, when the entity wears one (players do).
+    pub name: Option<String>,
+    /// Feet position in the world.
+    pub pos: (f64, f64, f64),
+}
+
+/// How close `/follow` stays to its target (baritone's `followRadius`).
+const FOLLOW_RADIUS: i32 = 3;
 
 /// The state of a running `/mine`.
 struct MineMission {
@@ -319,6 +367,14 @@ pub struct BotState {
     /// of the player (the hub's guest entry) lags behind respawns and
     /// other teleports.
     pub last_player: Option<PlayerInfo>,
+    /// The entity currently followed (`/follow`), by the game's entity id.
+    follow_target: Option<u32>,
+    /// The followed entity's last known feet position — the renderer's
+    /// goal box tracks it.
+    follow_pos: Option<(f64, f64, f64)>,
+    /// The follow goal the current path was planned for; a moved (or
+    /// changed) target invalidates it.
+    follow_goal: Option<GoalSpec>,
 }
 
 impl BotState {
@@ -341,6 +397,9 @@ impl BotState {
             mining_failures: 0,
             last_failure: None,
             last_player: None,
+            follow_target: None,
+            follow_pos: None,
+            follow_goal: None,
         }
     }
 
@@ -381,10 +440,14 @@ pub fn with_state<R>(f: impl FnOnce(&mut BotState) -> R) -> R {
 }
 
 /// The helper's per-tick entry point.
-pub fn tick_stateful(world: &LiveWorld<'_>, player: &PlayerInfo) -> (Inputs, Vec<String>) {
+pub fn tick_stateful(
+    world: &LiveWorld<'_>,
+    player: &PlayerInfo,
+    entities: &[EntityInfo],
+) -> (Inputs, Vec<String>) {
     with_state(|state| {
         state.last_player = Some(player.clone());
-        tick(state, world, player)
+        tick(state, world, player, entities)
     })
 }
 
@@ -514,12 +577,42 @@ pub fn handle_command(
                 z: pos.2 + dz * length,
             }))
         }
+        "follow" => {
+            // Baritone's FollowCommand groups: `players`, `entities`, a
+            // player by nametag (`player herobrine`), or an entity type
+            // (`entity zombie`, bare or `minecraft:`-prefixed).
+            let selector = match args.first().copied() {
+                Some("players") if args.len() == 1 => Some(FollowSelector::Players),
+                Some("entities") if args.len() == 1 => Some(FollowSelector::Entities),
+                Some("player") if args.len() == 2 => {
+                    Some(FollowSelector::Player(args[1].to_string()))
+                }
+                Some("entity") if args.len() == 2 => {
+                    Some(FollowSelector::EntityKind(bare_name(args[1]).to_string()))
+                }
+                _ => None,
+            };
+            match selector {
+                Some(selector) => {
+                    messages.push(format!("baritone: following {}", selector.describe()));
+                    Some(Mission::Follow(selector))
+                }
+                None => {
+                    messages.push(
+                        "baritone: usage: /follow players | entities | \
+                         player <name> | entity <kind>"
+                            .to_string(),
+                    );
+                    return (true, messages);
+                }
+            }
+        }
         "path" => {
             if state.mission.is_some() {
                 state.reset_path();
                 state.planned_target = None;
                 state.stuck_replans = 0;
-                if let Some(goal) = mission_goal(state.mission.as_ref()) {
+                if let Some(goal) = mission_goal(state) {
                     messages.push(format!("baritone: replanning to {}", goal.describe()));
                 }
             } else {
@@ -548,7 +641,8 @@ pub fn handle_command(
         "help" => {
             messages.push(
                 "baritone: /goto <x> <y> <z> | <x> <z> | <y> | /near [r] | \
-                 /mine <block…> [radius] | /tunnel [len] | /path | /eta | /status | /stop"
+                 /mine <block…> [radius] | /tunnel [len] | /follow players|entities|\
+                 player <name>|entity <kind> | /path | /eta | /status | /stop"
                     .to_string(),
             );
             return (true, messages);
@@ -563,6 +657,9 @@ pub fn handle_command(
         state.mining_failures = 0;
         state.last_failure = None;
         state.stuck_replans = 0;
+        state.follow_target = None;
+        state.follow_pos = None;
+        state.follow_goal = None;
         state.dimension = player.dimension.clone();
     }
     (true, messages)
@@ -642,6 +739,22 @@ fn status_line(state: &BotState) -> String {
             }
             line
         }
+        Some(Mission::Follow(selector)) => {
+            let mut line = format!("baritone: following {}", selector.describe());
+            if let (Some(pos), Some(path)) = (&state.follow_pos, &state.path) {
+                let left = path.length().saturating_sub(state.next_index);
+                line.push_str(&format!(
+                    " at ({:.0}, {:.0}, {:.0}) — {left} of {} blocks to go",
+                    pos.0,
+                    pos.1,
+                    pos.2,
+                    path.length()
+                ));
+            } else {
+                line.push_str(" — planning");
+            }
+            line
+        }
     }
 }
 
@@ -698,6 +811,7 @@ pub fn tick(
     state: &mut BotState,
     world: &LiveWorld<'_>,
     player: &PlayerInfo,
+    entities: &[EntityInfo],
 ) -> (Inputs, Vec<String>) {
     let mut messages = Vec::new();
 
@@ -786,7 +900,14 @@ pub fn tick(
         }
     }
 
-    let goal = mission_goal(state.mission.as_ref()).expect("a live mission has a goal");
+    // Follow upkeep: pick (or re-pick) the entity to head for, and drop
+    // the mission when nothing matches. Runs before the goal is derived —
+    // the follow goal moves with the target.
+    if !maintain_follow(state, entities, player, &mut messages) {
+        return finish(state, false, Inputs::idle(), messages);
+    }
+
+    let goal = mission_goal(state).expect("a live mission has a goal");
 
     if state.path.is_none() {
         if !plan(state, world, player, goal, true, &mut messages) {
@@ -1092,6 +1213,13 @@ pub fn tick(
         Placement::Halt => return finish(state, false, Inputs::idle(), messages),
     }
 
+    // A swim-up rises straight out of the water: walking forward would
+    // drift wherever the player happens to face, so hold still (re-center
+    // first, exactly like a pillar) and let the held jump key rise.
+    if matches!(step, Some(Moves::SwimUp)) {
+        inputs.forward = distance_xz(player, aim) > 0.2;
+    }
+
     if player.on_ground {
         // Step up onto the next block when close to it.
         if aim.1 > player.y + 0.5 && horizontal < 1.6 {
@@ -1266,8 +1394,8 @@ fn placement_pending(
 
 /// The goal the planner should head for: the mission's own, or the mine's
 /// current target.
-fn mission_goal(mission: Option<&Mission>) -> Option<GoalSpec> {
-    match mission {
+fn mission_goal(state: &BotState) -> Option<GoalSpec> {
+    match &state.mission {
         Some(Mission::Goto(spec)) => Some(*spec),
         Some(Mission::Mine(m)) => m.targets.first().map(|t| GoalSpec::Near {
             x: t.0,
@@ -1275,8 +1403,251 @@ fn mission_goal(mission: Option<&Mission>) -> Option<GoalSpec> {
             z: t.2,
             range: MINE_APPROACH_RANGE,
         }),
+        Some(Mission::Follow(_)) => state.follow_goal,
         None => None,
     }
+}
+
+/// Whether an entity with this kind and nametag satisfies a follow
+/// selector. Kinds are bare (`zombie`); names compare case-insensitively.
+fn follow_matches(selector: &FollowSelector, kind: &str, name: Option<&str>) -> bool {
+    let kind = kind.strip_prefix("minecraft:").unwrap_or(kind);
+    match selector {
+        FollowSelector::Entities => true,
+        FollowSelector::Players => kind == "player",
+        FollowSelector::Player(want) => {
+            kind == "player" && name.is_some_and(|n| n.eq_ignore_ascii_case(want))
+        }
+        FollowSelector::EntityKind(want) => {
+            let want = want.strip_prefix("minecraft:").unwrap_or(want);
+            kind == want
+        }
+    }
+}
+
+/// One tick of follow upkeep: keep the nearest matching entity as the
+/// target, moving the goal (and the path) as it goes. Reports whether the
+/// mission is still alive — nothing matching ends it.
+fn maintain_follow(
+    state: &mut BotState,
+    entities: &[EntityInfo],
+    player: &PlayerInfo,
+    messages: &mut Vec<String>,
+) -> bool {
+    let Some(Mission::Follow(selector)) = &state.mission else {
+        return true;
+    };
+    let describe = selector.describe();
+    let target = entities
+        .iter()
+        .filter(|e| follow_matches(selector, &e.kind, e.name.as_deref()))
+        .min_by(|a, b| {
+            let da = (a.pos.0 - player.x).powi(2)
+                + (a.pos.1 - player.y).powi(2)
+                + (a.pos.2 - player.z).powi(2);
+            let db = (b.pos.0 - player.x).powi(2)
+                + (b.pos.1 - player.y).powi(2)
+                + (b.pos.2 - player.z).powi(2);
+            da.total_cmp(&db)
+        });
+    let Some(e) = target else {
+        messages.push("baritone: nothing to follow — stopping".to_string());
+        state.mission = None;
+        state.follow_target = None;
+        state.follow_pos = None;
+        state.follow_goal = None;
+        state.reset_path();
+        return false;
+    };
+    let block = (e.pos.0.floor() as i32, e.pos.1.floor() as i32, e.pos.2.floor() as i32);
+    let goal = GoalSpec::Near {
+        x: block.0,
+        y: block.1,
+        z: block.2,
+        range: FOLLOW_RADIUS,
+    };
+    if state.follow_target != Some(e.id) {
+        let first = state.follow_target.is_none();
+        state.follow_target = Some(e.id);
+        state.follow_goal = Some(goal);
+        state.reset_path();
+        if first {
+            messages.push(format!("baritone: following {describe}"));
+        }
+    } else if state.follow_goal != Some(goal) {
+        // Same entity, new block: the goal moves with it.
+        state.follow_goal = Some(goal);
+        state.reset_path();
+    }
+    state.follow_pos = Some(e.pos);
+    true
+}
+
+/// Baritone's render colors, its `Settings` defaults: the goal box green,
+/// the current path red, blocks to break red, to place green, the block
+/// walked into magenta.
+pub const COLOR_GOAL: u32 = 0xFF_00_FF_00;
+pub const COLOR_PATH: u32 = 0xFF_FF_00_00;
+pub const COLOR_TO_BREAK: u32 = 0xFF_FF_00_00;
+pub const COLOR_TO_PLACE: u32 = 0xFF_00_FF_00;
+pub const COLOR_TO_WALK_INTO: u32 = 0xFF_FF_00_FF;
+
+/// One wireframe primitive the client should draw this frame: a box as
+/// (min, max, color) or a line segment as (start, end, color), world
+/// coordinates, ARGB colors.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Scene {
+    pub boxes: Vec<([f64; 3], [f64; 3], u32)>,
+    pub segs: Vec<([f64; 3], [f64; 3], u32)>,
+}
+
+/// What the client should draw for the bot this frame — baritone's
+/// `PathRenderer`: the goal as a bobbing two-tall green box (a full
+/// column for an XZ goal), the path as red lines through its blocks, the
+/// block being broken red, the block to place green, the next waypoint
+/// magenta.
+pub fn render_scene(state: &BotState) -> Scene {
+    let mut scene = Scene::default();
+    let ticks = state.last_player.as_ref().map_or(0, |p| p.ticks);
+
+    // The goal: a goto's fixed spec, or the follow target's moving one.
+    if let Some(spec) = match &state.mission {
+        Some(Mission::Goto(spec)) => Some(*spec),
+        Some(Mission::Follow(_)) => state.follow_goal,
+        _ => None,
+    } {
+        draw_goal(&mut scene, spec, state, ticks);
+    }
+
+    // The path's remaining blocks, nearest waypoint first.
+    if let Some(path) = &state.path {
+        let positions = path.positions();
+        let from = state.next_index.min(positions.len().saturating_sub(1));
+        for pair in positions[from..].windows(2) {
+            let a = center_of_f(pair[0]);
+            let b = center_of_f(pair[1]);
+            scene.segs.push((a, b, COLOR_PATH));
+        }
+        // The block walked into right now.
+        let wp = positions[from];
+        scene
+            .boxes
+            .push(box_of(wp, COLOR_TO_WALK_INTO));
+    }
+
+    // The block being broken right now.
+    if let Some(stint) = &state.mining {
+        scene.boxes.push(box_of(stint.pos, COLOR_TO_BREAK));
+    }
+
+    // The cell a pending placement fills.
+    if state.place_tick.is_some()
+        && let Some(path) = &state.path
+        && let Some(mv) = state.next_index.checked_sub(1).and_then(|i| path.movements().get(i))
+        && matches!(
+            mv,
+            Moves::PillarUp
+                | Moves::BridgeNorth
+                | Moves::BridgeSouth
+                | Moves::BridgeEast
+                | Moves::BridgeWest
+        )
+        && let Some(&wp) = path.positions().get(state.next_index)
+    {
+        scene.boxes.push(box_of((wp.0, wp.1 - 1, wp.2), COLOR_TO_PLACE));
+    }
+
+    scene
+}
+
+/// The goal's wireframe: a two-tall box around the goal block with two
+/// bobbing rings through it (baritone's `drawGoal`), a full column for an
+/// XZ goal, a slab for a Y level. `ticks` drives the bob (a two-second
+/// period, like baritone's).
+fn draw_goal(scene: &mut Scene, spec: GoalSpec, state: &BotState, ticks: u64) {
+    match spec {
+        GoalSpec::Block { x, y, z } | GoalSpec::Near { x, y, z, .. } => {
+            let bob = bob_of(ticks);
+            let (x, y, z) = (f64::from(x), f64::from(y), f64::from(z));
+            scene.boxes.push((
+                [x + 0.002, y, z + 0.002],
+                [x + 0.998, y + 2.0, z + 0.998],
+                COLOR_GOAL,
+            ));
+            let (px, pz) = (x + 0.5, z + 0.5);
+            for ring_y in [y + 1.0 + bob, y + 1.0 - bob] {
+                ring(scene, px, ring_y, pz, COLOR_GOAL);
+            }
+        }
+        GoalSpec::Xz { x, z } => {
+            // Baritone spans the world's full height; the dimension's
+            // build limits are not known here, so -64..320 covers the
+            // overworld.
+            scene.boxes.push((
+                [f64::from(x) + 0.002, -64.0, f64::from(z) + 0.002],
+                [f64::from(x) + 0.998, 320.0, f64::from(z) + 0.998],
+                COLOR_GOAL,
+            ));
+        }
+        GoalSpec::YLevel { y } => {
+            // A plane at the level, centered on the player (baritone
+            // draws the whole XZ plane; a radius keeps the line budget
+            // sane).
+            if let Some(p) = &state.last_player {
+                let (px, pz) = (p.x, p.z);
+                scene.boxes.push((
+                    [px - 16.0, f64::from(y), pz - 16.0],
+                    [px + 16.0, f64::from(y) + 1.0, pz + 16.0],
+                    COLOR_GOAL,
+                ));
+            }
+        }
+    }
+}
+
+/// The goal box's ring bob: `cos` over a two-second period, ±0.5 blocks.
+fn bob_of(ticks: u64) -> f64 {
+    0.5 * ((f64::from((ticks % 40) as u32) / 40.0) * std::f64::consts::TAU).cos()
+}
+
+/// One horizontal square ring around (x, y, z).
+fn ring(scene: &mut Scene, x: f64, y: f64, z: f64, color: u32) {
+    let half = 0.498;
+    let corners = [
+        ([x - half, y, z - half], [x + half, y, z - half]),
+        ([x + half, y, z - half], [x + half, y, z + half]),
+        ([x + half, y, z + half], [x - half, y, z + half]),
+        ([x - half, y, z + half], [x - half, y, z - half]),
+    ];
+    for (a, b) in corners {
+        scene.segs.push((a, b, color));
+    }
+}
+
+/// A one-block selection box around a cell.
+fn box_of(pos: (i32, i32, i32), color: u32) -> ([f64; 3], [f64; 3], u32) {
+    (
+        [
+            f64::from(pos.0),
+            f64::from(pos.1),
+            f64::from(pos.2),
+        ],
+        [
+            f64::from(pos.0) + 1.0,
+            f64::from(pos.1) + 1.0,
+            f64::from(pos.2) + 1.0,
+        ],
+        color,
+    )
+}
+
+/// A block's center, as f64 coordinates.
+fn center_of_f(pos: (i32, i32, i32)) -> [f64; 3] {
+    [
+        f64::from(pos.0) + 0.5,
+        f64::from(pos.1) + 0.5,
+        f64::from(pos.2) + 0.5,
+    ]
 }
 
 /// What the mine upkeep decided.
@@ -1695,7 +2066,8 @@ mod tests {
     /// tick, like a real one streaming back. Vertical motion is crudely
     /// simulated so pillar jumps work: a jump rises 0.42 a tick with drag
     /// and gravity, and the feet land on the highest solid block top below
-    /// them.
+    /// them. In water the jump key rises gently instead, idling sinks, and
+    /// the player's own `in_water` flag follows the feet cell.
     fn drive(
         blocks: &mut HashMap<(i32, i32, i32), &'static str>,
         state: &mut BotState,
@@ -1724,35 +2096,63 @@ mod tests {
                     }
                 }
             }
-            if jump && player.on_ground {
-                player.on_ground = false;
-                vy = 0.42;
-            }
-            if !player.on_ground {
+            let bx = player.x.floor() as i32;
+            let bz = player.z.floor() as i32;
+            let feet = player.y.floor() as i32;
+            let water_at = |y: i32| blocks.get(&(bx, y, bz)) == Some(&"minecraft:water");
+            let in_water = water_at(feet) || water_at(feet + 1);
+            player.in_water = in_water;
+            if in_water {
+                // Swimming: the jump key rises, idling sinks, and the
+                // bottom stops the sink.
+                vy = if jump { 0.12 } else { (vy - 0.02).max(-0.08) };
                 player.y += vy;
-                vy = (vy - 0.08) * 0.98;
-                let bx = player.x.floor() as i32;
-                let bz = player.z.floor() as i32;
-                let feet = player.y.floor() as i32;
-                let solid = |y: i32| {
-                    blocks
-                        .get(&(bx, y, bz))
-                        .is_some_and(|b| !super::is_passable(b))
-                };
-                let top = (feet - 8..=feet)
-                    .rev()
-                    .find(|y| solid(*y))
-                    .map(|y| f64::from(y + 1));
-                if vy < 0.0
-                    && let Some(top) = top
-                    && player.y <= top
-                {
-                    player.y = top;
-                    player.on_ground = true;
-                    vy = 0.0;
+                player.on_ground = false;
+                if vy < 0.0 {
+                    let solid = |y: i32| {
+                        blocks
+                            .get(&(bx, y, bz))
+                            .is_some_and(|b| !super::is_passable(b))
+                    };
+                    if let Some(top) = (feet - 6..=feet)
+                        .rev()
+                        .find(|y| solid(*y))
+                        .map(|y| f64::from(y + 1))
+                        && player.y <= top
+                    {
+                        player.y = top;
+                        player.on_ground = true;
+                        vy = 0.0;
+                    }
+                }
+            } else {
+                if jump && player.on_ground {
+                    player.on_ground = false;
+                    vy = 0.42;
+                }
+                if !player.on_ground {
+                    player.y += vy;
+                    vy = (vy - 0.08) * 0.98;
+                    let solid = |y: i32| {
+                        blocks
+                            .get(&(bx, y, bz))
+                            .is_some_and(|b| !super::is_passable(b))
+                    };
+                    let top = (feet - 8..=feet)
+                        .rev()
+                        .find(|y| solid(*y))
+                        .map(|y| f64::from(y + 1));
+                    if vy < 0.0
+                        && let Some(top) = top
+                        && player.y <= top
+                    {
+                        player.y = top;
+                        player.on_ground = true;
+                        vy = 0.0;
+                    }
                 }
             }
-            let (inputs, tick_messages) = tick(state, &world, player);
+            let (inputs, tick_messages) = tick(state, &world, player, &[]);
             messages = tick_messages;
             forward = inputs.forward;
             jump = inputs.jump;
@@ -1785,7 +2185,7 @@ mod tests {
         assert_eq!(state.goal(), Some(GoalSpec::Block { x: 4, y: 65, z: 4 }));
         assert!(messages.is_empty());
 
-        let (inputs, messages) = tick(&mut state, &world, &player);
+        let (inputs, messages) = tick(&mut state, &world, &player, &[]);
         assert!(inputs.driving);
         assert!(inputs.forward);
         assert!(messages.iter().any(|m| m.contains("pathing to (4, 65, 4)")));
@@ -1808,7 +2208,7 @@ mod tests {
         let mut state = BotState::new();
         let mut player = player_at(0.0, 65.0, 0.0, 100);
         handle_command(&mut state, "goto 2 65 2", &player, &world);
-        let (inputs, _) = tick(&mut state, &world, &player);
+        let (inputs, _) = tick(&mut state, &world, &player, &[]);
         assert!(inputs.driving);
 
         // Walk the path: put the player near the current waypoint each
@@ -1818,7 +2218,7 @@ mod tests {
             player.x = f64::from(step) + 0.4;
             player.z = f64::from(step) + 0.4;
             player.ticks = ticks;
-            let (inputs, tick_messages) = tick(&mut state, &world, &player);
+            let (inputs, tick_messages) = tick(&mut state, &world, &player, &[]);
             if step < 2 {
                 assert!(inputs.driving, "still walking at step {step}");
             }
@@ -1838,18 +2238,18 @@ mod tests {
         let mut state = BotState::new();
         let player = player_at(0.0, 65.0, 0.0, 100);
         handle_command(&mut state, "goto 4 65 4", &player, &world);
-        tick(&mut state, &world, &player);
+        tick(&mut state, &world, &player, &[]);
         let index = state.next_index;
         let center = center_of(state.path.as_ref().unwrap().positions()[1]);
 
         // 0.7 blocks from the waypoint's center is not reached yet.
         let near = player_at(center.0 + 0.7, 65.0, center.2, 101);
-        tick(&mut state, &world, &near);
+        tick(&mut state, &world, &near, &[]);
         assert_eq!(state.next_index, index);
 
         // 0.4 from it: reached, the next waypoint becomes the aim.
         let on = player_at(center.0 + 0.4, 65.0, center.2, 102);
-        let (inputs, _) = tick(&mut state, &world, &on);
+        let (inputs, _) = tick(&mut state, &world, &on, &[]);
         assert!(inputs.driving);
         assert_eq!(state.next_index, index + 1);
     }
@@ -1901,7 +2301,7 @@ mod tests {
                 range: 3
             })
         );
-        let (inputs, messages) = tick(&mut state, &world, &player);
+        let (inputs, messages) = tick(&mut state, &world, &player, &[]);
         assert!(!inputs.driving);
         assert!(messages.iter().any(|m| m.contains("reached")));
     }
@@ -1946,7 +2346,7 @@ mod tests {
         let mut state = BotState::new();
         let player = player_at(0.0, 65.0, 0.0, 10);
         handle_command(&mut state, "goto 4 65 4", &player, &world);
-        let (inputs, _) = tick(&mut state, &world, &player);
+        let (inputs, _) = tick(&mut state, &world, &player, &[]);
         assert!(inputs.driving);
 
         // The chat opens: pause, and release the keys exactly once.
@@ -1954,14 +2354,14 @@ mod tests {
             active: false,
             ..player_at(0.0, 65.0, 0.0, 11)
         };
-        let (inputs, _) = tick(&mut state, &world, &paused);
+        let (inputs, _) = tick(&mut state, &world, &paused, &[]);
         assert!(!inputs.driving);
         assert!(inputs.clear);
-        let (inputs, _) = tick(&mut state, &world, &paused);
+        let (inputs, _) = tick(&mut state, &world, &paused, &[]);
         assert!(!inputs.clear, "idle ticks leave the key set alone");
 
         // Back to the game: driving resumes.
-        let (inputs, _) = tick(&mut state, &world, &player);
+        let (inputs, _) = tick(&mut state, &world, &player, &[]);
         assert!(inputs.driving);
     }
 
@@ -1974,14 +2374,14 @@ mod tests {
         let mut state = BotState::new();
         let player = player_at(0.0, 65.0, 0.0, 1_000);
         handle_command(&mut state, "goto 30 65 30", &player, &world);
-        tick(&mut state, &world, &player);
+        tick(&mut state, &world, &player, &[]);
         assert!(state.path.is_some());
 
         // Three failed re-plans already; stuck again: give up.
         state.progress_tick = player.ticks - 200;
         state.stuck_replans = MAX_STUCK_REPLANS;
         state.last_plan_tick = player.ticks - 1_000;
-        let (inputs, messages) = tick(&mut state, &world, &player);
+        let (inputs, messages) = tick(&mut state, &world, &player, &[]);
         assert!(!inputs.driving);
         assert!(state.mission.is_none());
         assert!(messages.iter().any(|m| m.contains("giving up")));
@@ -1996,23 +2396,23 @@ mod tests {
         let mut state = BotState::new();
         let player = player_at(0.0, 65.0, 0.0, 10);
         handle_command(&mut state, "goto 4 65 4", &player, &world);
-        tick(&mut state, &world, &player);
+        tick(&mut state, &world, &player, &[]);
 
         let dead = PlayerInfo {
             health: 0.0,
             ..player_at(0.0, 65.0, 0.0, 11)
         };
-        let (inputs, messages) = tick(&mut state, &world, &dead);
+        let (inputs, messages) = tick(&mut state, &world, &dead, &[]);
         assert!(!inputs.driving);
         assert!(messages.iter().any(|m| m.contains("died")));
 
         handle_command(&mut state, "goto 4 65 4", &player, &world);
-        tick(&mut state, &world, &player);
+        tick(&mut state, &world, &player, &[]);
         let nether = PlayerInfo {
             dimension: String::from("minecraft:the_nether"),
             ..player_at(0.0, 65.0, 0.0, 12)
         };
-        let (inputs, messages) = tick(&mut state, &world, &nether);
+        let (inputs, messages) = tick(&mut state, &world, &nether, &[]);
         assert!(!inputs.driving);
         assert!(messages.iter().any(|m| m.contains("dimension")));
         assert!(state.mission.is_none());
@@ -2027,7 +2427,7 @@ mod tests {
         let mut state = BotState::new();
         let player = player_at(0.0, 65.0, 0.0, 10);
         handle_command(&mut state, "goto 4 65 4", &player, &world);
-        let (inputs, _) = tick(&mut state, &world, &player);
+        let (inputs, _) = tick(&mut state, &world, &player, &[]);
         assert!(inputs.driving);
 
         let inputs = world_closed(&mut state);
@@ -2057,7 +2457,7 @@ mod tests {
         let mut state = BotState::new();
         let player = player_at(0.0, 65.0, 0.0, 100);
         handle_command(&mut state, "goto 8 65 0", &player, &world);
-        let (inputs, messages) = tick(&mut state, &world, &player);
+        let (inputs, messages) = tick(&mut state, &world, &player, &[]);
         assert!(inputs.driving, "messages: {messages:?}");
         let has_parkour = state
             .path
@@ -2092,7 +2492,7 @@ mod tests {
             let reader = reader(&blocks);
             let world = LiveWorld::new(&reader);
             handle_command(&mut state, "goto 12 65 0", &player, &world);
-            tick(&mut state, &world, &player);
+            tick(&mut state, &world, &player, &[]);
             let path = state.path.as_ref().expect("planned east");
             path.positions()[3]
         };
@@ -2166,7 +2566,7 @@ mod tests {
             let reader = reader(&blocks);
             let world = LiveWorld::new(&reader);
             handle_command(&mut state, "goto 0 66 0", &player, &world);
-            tick(&mut state, &world, &player);
+            tick(&mut state, &world, &player, &[]);
         }
         assert!(
             state
@@ -2220,7 +2620,7 @@ mod tests {
             let reader = reader(&blocks);
             let world = LiveWorld::new(&reader);
             handle_command(&mut state, "goto 8 65 0", &player, &world);
-            tick(&mut state, &world, &player);
+            tick(&mut state, &world, &player, &[]);
         }
         assert!(
             state
@@ -2275,7 +2675,7 @@ mod tests {
             let reader = reader(&blocks);
             let world = LiveWorld::new(&reader);
             handle_command(&mut state, "goto 8 65 0", &player, &world);
-            tick(&mut state, &world, &player);
+            tick(&mut state, &world, &player, &[]);
         }
         let path = state.path.expect("a path still exists");
         assert!(
@@ -2312,7 +2712,7 @@ mod tests {
             let world = LiveWorld::new(&reader);
             let (claimed, _) = handle_command(&mut state, "goto 10 65 0", &player, &world);
             assert!(claimed);
-            let (_, messages) = tick(&mut state, &world, &player);
+            let (_, messages) = tick(&mut state, &world, &player, &[]);
             assert!(messages.iter().any(|m| m.contains("pathing")));
         }
 
@@ -2364,7 +2764,7 @@ mod tests {
             let world = LiveWorld::new(&reader);
             let (claimed, _) = handle_command(&mut state, "mine iron_ore", &player, &world);
             assert!(claimed);
-            let (inputs, _) = tick(&mut state, &world, &player);
+            let (inputs, _) = tick(&mut state, &world, &player, &[]);
             assert_eq!(inputs.mine, Some((2, 65, 0)));
             // The stone pickaxe is held for the ore; the dirt in slot 1
             // does nothing for it.
@@ -2381,7 +2781,7 @@ mod tests {
             let reader = reader(&blocks);
             let world = LiveWorld::new(&reader);
             handle_command(&mut state, "mine iron_ore", &player, &world);
-            let (inputs, _) = tick(&mut state, &world, &player);
+            let (inputs, _) = tick(&mut state, &world, &player, &[]);
             assert_eq!(inputs.select, Some(0));
         }
     }
@@ -2405,7 +2805,7 @@ mod tests {
         let mut state = BotState::new();
         let player = player_at(0.0, 65.0, 0.0, 100);
         handle_command(&mut state, "goto 6 65 0", &player, &world);
-        tick(&mut state, &world, &player);
+        tick(&mut state, &world, &player, &[]);
         let path = state.path.as_ref().expect("a path around the drift");
         for (x, y, z) in path.positions() {
             assert!(
@@ -2539,14 +2939,14 @@ mod tests {
         handle_command(&mut state, "mine iron_ore", &player, &world);
 
         // First tick: the scan finds the ore and plans to it.
-        let (_, messages) = tick(&mut state, &world, &player);
+        let (_, messages) = tick(&mut state, &world, &player, &[]);
         assert!(messages.iter().any(|m| m.contains("in range")));
 
         // In range: mining starts.
         player.x = 2.5;
         player.z = 0.5;
         player.ticks = 1_100;
-        let (inputs, _) = tick(&mut state, &world, &player);
+        let (inputs, _) = tick(&mut state, &world, &player, &[]);
         assert_eq!(inputs.mine, Some((4, 65, 0)));
 
         // Two stints that run triple their expected time: the block is
@@ -2556,7 +2956,7 @@ mod tests {
             if state.mining.is_some() {
                 state.mining.as_mut().expect("checked").started = ticks - 1_000;
             }
-            let (_, messages) = tick(&mut state, &world, &player);
+            let (_, messages) = tick(&mut state, &world, &player, &[]);
             if ticks == 1_400 {
                 assert!(
                     messages.iter().any(|m| m.contains("can't break")),
@@ -2617,7 +3017,7 @@ mod tests {
 
         let (claimed, _) = handle_command(&mut state, "mine coal_ore", &player, &world);
         assert!(claimed);
-        let (inputs, _) = tick(&mut state, &world, &player);
+        let (inputs, _) = tick(&mut state, &world, &player, &[]);
         // (4, 65, 0) is 2.5 blocks from the eye — in approach range, but
         // the stone at (3, 65, 0) hides it: dig the stone, not the ore.
         assert_eq!(inputs.mine, Some((3, 65, 0)), "must dig the occluder");
@@ -2633,7 +3033,7 @@ mod tests {
         let mut state = BotState::new();
         let player = player_at(0.0, 65.0, 0.0, 100);
         handle_command(&mut state, "goto 10 65 0", &player, &world);
-        tick(&mut state, &world, &player);
+        tick(&mut state, &world, &player, &[]);
 
         let (claimed, messages) = handle_command(&mut state, "status", &player, &world);
         assert!(claimed);
@@ -2692,7 +3092,7 @@ mod tests {
         let (claimed, _) = handle_command(&mut state, "goto 20 109 0", &player, &world);
         assert!(claimed);
 
-        let (inputs, messages) = tick(&mut state, &world, &player);
+        let (inputs, messages) = tick(&mut state, &world, &player, &[]);
         eprintln!("messages: {messages:?}");
         eprintln!("driving: {}", inputs.driving);
         if let Some(path) = state.path.as_ref() {
@@ -2746,7 +3146,7 @@ mod tests {
         let (claimed, _) = handle_command(&mut state, "goto 20 109 0", &player, &world);
         assert!(claimed);
 
-        let (inputs, messages) = tick(&mut state, &world, &player);
+        let (inputs, messages) = tick(&mut state, &world, &player, &[]);
         eprintln!("messages: {messages:?}");
         eprintln!("driving: {}", inputs.driving);
         if let Some(path) = state.path.as_ref() {
@@ -2759,5 +3159,223 @@ mod tests {
             state.path.is_some(),
             "planner must find a way out of the live pocket, got: {messages:?}"
         );
+    }
+
+    #[test]
+    fn swims_up_out_of_a_pool() {
+        let mut blocks = HashMap::new();
+        stone_floor(&mut blocks, 8);
+        // A 3×3 pool two deep: the floor blocks at y64 become water over a
+        // stone bottom at y62, so wading on the bottom cannot reach the
+        // shore — only swimming up and out does.
+        for x in -1..=1 {
+            for z in -1..=1 {
+                blocks.insert((x, 64, z), "minecraft:water");
+                blocks.insert((x, 63, z), "minecraft:water");
+                blocks.insert((x, 62, z), "minecraft:stone");
+            }
+        }
+        let mut state = BotState::new();
+        // Floating in the pool's center, feet at the top water cell.
+        let mut player = player_at(0.5, 64.5, 0.5, 100);
+        player.on_ground = false;
+
+        {
+            let reader = reader(&blocks);
+            let world = LiveWorld::new(&reader);
+            let (claimed, _) = handle_command(&mut state, "goto 4 65 4", &player, &world);
+            assert!(claimed);
+        }
+        let messages = drive(&mut blocks, &mut state, &mut player);
+        assert!(
+            messages.iter().any(|m| m.contains("reached")),
+            "must swim out and reach the goal: {messages:?}"
+        );
+        assert!(player.on_ground, "ends standing on the shore");
+    }
+
+    #[test]
+    fn swims_across_a_deep_pond_without_blocks_to_place() {
+        let mut blocks = HashMap::new();
+        stone_floor(&mut blocks, 8);
+        // A 3-wide pond with no bottom within reach: swimming is the only
+        // way across, and the hotbar holds nothing placeable to bridge
+        // with.
+        for x in 1..=3 {
+            for z in -8..=8 {
+                blocks.insert((x, 64, z), "minecraft:water");
+                blocks.insert((x, 63, z), "minecraft:water");
+                blocks.insert((x, 62, z), "minecraft:water");
+                blocks.insert((x, 61, z), "minecraft:stone");
+            }
+        }
+        let mut state = BotState::new();
+        let mut player = player_at(0.5, 65.0, 0.0, 100);
+
+        {
+            let reader = reader(&blocks);
+            let world = LiveWorld::new(&reader);
+            let (claimed, _) = handle_command(&mut state, "goto 6 65 0", &player, &world);
+            assert!(claimed);
+        }
+        let messages = drive(&mut blocks, &mut state, &mut player);
+        assert!(
+            messages.iter().any(|m| m.contains("reached")),
+            "must swim across and reach the goal: {messages:?}"
+        );
+        assert!(player.x > f64::from(4), "crossed to the far shore");
+    }
+
+    #[test]
+    fn follows_the_nearest_matching_entity() {
+        let mut blocks = HashMap::new();
+        stone_floor(&mut blocks, 40);
+        let reader = reader(&blocks);
+        let world = LiveWorld::new(&reader);
+        let mut state = BotState::new();
+        let player = player_at(0.0, 65.0, 0.0, 100);
+
+        let (claimed, _) = handle_command(&mut state, "follow players", &player, &world);
+        assert!(claimed);
+        let entities = vec![
+            EntityInfo {
+                id: 1,
+                kind: String::from("player"),
+                name: Some(String::from("far")),
+                pos: (5.0, 65.0, 5.0),
+            },
+            EntityInfo {
+                id: 2,
+                kind: String::from("player"),
+                name: Some(String::from("near")),
+                pos: (2.0, 65.0, 2.0),
+            },
+        ];
+        let (inputs, messages) = tick(&mut state, &world, &player, &entities);
+        assert!(messages.iter().any(|m| m.contains("following players")));
+        assert_eq!(state.follow_target, Some(2), "the nearest one");
+        assert_eq!(
+            state.follow_goal,
+            Some(GoalSpec::Near {
+                x: 2,
+                y: 65,
+                z: 2,
+                range: 3
+            })
+        );
+        assert!(inputs.driving, "already walking toward the target");
+
+        // The target wanders off and the other player is now nearer: the
+        // goal moves with it, silently.
+        let moved = vec![EntityInfo {
+            id: 2,
+            kind: String::from("player"),
+            name: Some(String::from("near")),
+            pos: (3.0, 65.0, 2.0),
+        }];
+        let (_, messages) = tick(&mut state, &world, &player, &moved);
+        assert!(!messages.iter().any(|m| m.contains("following")), "no repeat announce");
+        assert_eq!(
+            state.follow_goal,
+            Some(GoalSpec::Near {
+                x: 3,
+                y: 65,
+                z: 2,
+                range: 3
+            })
+        );
+
+        // Nothing matching any more: the mission ends.
+        let (_, messages) = tick(&mut state, &world, &player, &[]);
+        assert!(messages.iter().any(|m| m.contains("nothing to follow")));
+        assert!(state.mission.is_none());
+    }
+
+    #[test]
+    fn follow_selectors_match_kinds_and_names() {
+        assert!(follow_matches(&FollowSelector::Players, "player", None));
+        assert!(!follow_matches(&FollowSelector::Players, "zombie", None));
+        assert!(follow_matches(
+            &FollowSelector::Player("Herobrine".into()),
+            "minecraft:player",
+            Some("herobrine")
+        ));
+        assert!(!follow_matches(
+            &FollowSelector::Player("Herobrine".into()),
+            "player",
+            Some("notch")
+        ));
+        assert!(follow_matches(
+            &FollowSelector::EntityKind("cow".into()),
+            "minecraft:cow",
+            None
+        ));
+        assert!(follow_matches(&FollowSelector::Entities, "enderman", None));
+    }
+
+    #[test]
+    fn renders_goal_path_and_work_blocks() {
+        let mut blocks = HashMap::new();
+        stone_floor(&mut blocks, 8);
+        let reader = reader(&blocks);
+        let world = LiveWorld::new(&reader);
+        let mut state = BotState::new();
+        let player = player_at(0.0, 65.0, 0.0, 100);
+        handle_command(&mut state, "goto 4 65 4", &player, &world);
+        tick(&mut state, &world, &player, &[]);
+
+        let scene = render_scene(&state);
+        // The goal: a green box at the goal cell, two tall, inset a
+        // little like baritone's.
+        assert!(
+            scene.boxes.iter().any(|(min, max, c)| {
+                *c == COLOR_GOAL
+                    && min[0] == 4.002
+                    && min[1] == 65.0
+                    && min[2] == 4.002
+                    && max[0] == 4.998
+                    && max[1] == 67.0
+                    && max[2] == 4.998
+            }),
+            "green goal box missing: {:?}",
+            scene.boxes
+        );
+        // The path: red segments joining its block centers, starting at
+        // the next waypoint.
+        let positions = state.path.as_ref().unwrap().positions();
+        let first = center_of_f(positions[state.next_index]);
+        let second = center_of_f(positions[state.next_index + 1]);
+        assert!(
+            scene.segs.iter().any(|(a, b, c)| {
+                *c == COLOR_PATH
+                    && a[0] == first[0]
+                    && a[1] == first[1]
+                    && a[2] == first[2]
+                    && b[0] == second[0]
+                    && b[1] == second[1]
+                    && b[2] == second[2]
+            }),
+            "red path segment missing: {:?}",
+            scene.segs
+        );
+        // The block walked into right now: magenta.
+        let wp = positions[state.next_index];
+        assert!(scene.boxes.iter().any(|(min, max, c)| {
+            *c == COLOR_TO_WALK_INTO
+                && min[0] == f64::from(wp.0)
+                && min[1] == f64::from(wp.1)
+                && min[2] == f64::from(wp.2)
+                && max[0] == f64::from(wp.0) + 1.0
+        }));
+        // The block being broken right now: red.
+        state.mining = Some(MiningStint {
+            pos: (1, 65, 1),
+            name: String::from("minecraft:stone"),
+            started: 99,
+        });
+        let scene = render_scene(&state);
+        assert!(scene.boxes.iter().any(|(min, _, c)| {
+            *c == COLOR_TO_BREAK && min[0] == 1.0 && min[1] == 65.0 && min[2] == 1.0
+        }));
     }
 }

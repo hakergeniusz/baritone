@@ -43,6 +43,12 @@ pub mod action_costs {
     /// lands the same tick and the block appears the next, with a little
     /// aim-settling slack.
     pub const PLACE_BLOCK_COST: f64 = 4.0;
+    /// Swimming up one block in water. Baritone never prices vertical
+    /// swimming (`MovementDescend` leaves a "TODO incorporate water swim
+    /// up cost?" where it would belong) and so cannot escape deep water;
+    /// the port adds the move and prices it at the in-water walk cost —
+    /// a surfaced swim-up takes about a second.
+    pub const SWIM_UP_ONE_BLOCK_COST: f64 = 20.0;
     /// "Infinite" cost — unreachable. Not MAX to avoid overflow when added.
     pub const COST_INF: f64 = 1_000_000.0;
     /// Deepest unprotected fall (no water, no bucket, no ladder) the planner

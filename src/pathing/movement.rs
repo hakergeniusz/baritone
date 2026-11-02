@@ -99,6 +99,11 @@ pub enum Moves {
     BridgeSouth,
     BridgeEast,
     BridgeWest,
+
+    // --- Swimming (1) — rise one block through water ---
+    /// Straight up while in water: swim to the surface (an addition over
+    /// baritone, which wades on the bottom and cannot escape deep water).
+    SwimUp,
 }
 
 /// The (x, y, z) offset for each move type (when `dynamicXZ`/`dynamicY` is false).
@@ -135,6 +140,7 @@ fn static_offset(mv: Moves) -> (i32, i32, i32) {
         Moves::BridgeSouth => (0, 0, 1),
         Moves::BridgeEast => (1, 0, 0),
         Moves::BridgeWest => (-1, 0, 0),
+        Moves::SwimUp => (0, 1, 0),
     }
 }
 
@@ -167,6 +173,7 @@ impl Moves {
             Moves::BridgeSouth,
             Moves::BridgeEast,
             Moves::BridgeWest,
+            Moves::SwimUp,
         ]
     }
 
@@ -230,6 +237,7 @@ impl Moves {
             Moves::BridgeSouth => bridge_cost(world, tools, x, y, z, 0, 1),
             Moves::BridgeEast => bridge_cost(world, tools, x, y, z, 1, 0),
             Moves::BridgeWest => bridge_cost(world, tools, x, y, z, -1, 0),
+            Moves::SwimUp => swim_up_cost(world, tools, x, y, z),
         }
     }
 }
@@ -720,13 +728,63 @@ fn traverse_cost(
         };
     }
 
-    // Can't walk on — would need to place a block (bridge). The executor
-    // can't place, so this is impassable.
+    // Can't walk on — deep water, then: swim into it. The destination's
+    // feet hold water and its bottom is out of reach, so the move is a
+    // surface (or underwater) swim (baritone's traverse only wades on the
+    // bottom and refuses the rest; the swim-up move handles rising).
+    if block_tags::is_water(&world.get_block(dest_x, y, dest_z)) {
+        let head = world.get_block(dest_x, y + 1, dest_z);
+        let mine_head = mining_cost(world, tools, dest_x, y + 1, dest_z, &head, true);
+        if mine_head < action_costs::COST_INF {
+            return MoveResult {
+                x: dest_x,
+                y,
+                z: dest_z,
+                cost: action_costs::WALK_ONE_IN_WATER_COST + mine_head,
+            };
+        }
+    }
     MoveResult {
         x: 0,
         y: 0,
         z: 0,
         cost: action_costs::COST_INF,
+    }
+}
+
+/// Cost to swim straight up one block while in water. No baritone
+/// equivalent (it has no vertical water move at all): the start must be
+/// submerged at feet or head, the landing space is mined first if solid.
+fn swim_up_cost(world: &LiveWorld, tools: &ToolSet, x: i32, y: i32, z: i32) -> MoveResult {
+    if !block_tags::is_water(&world.get_block(x, y, z))
+        && !block_tags::is_water(&world.get_block(x, y + 1, z))
+    {
+        return MoveResult {
+            x: 0,
+            y: 0,
+            z: 0,
+            cost: action_costs::COST_INF,
+        };
+    }
+    let mut cost = action_costs::SWIM_UP_ONE_BLOCK_COST;
+    for (by, upper) in [(y + 1, false), (y + 2, true)] {
+        let block = world.get_block(x, by, z);
+        let mine = mining_cost(world, tools, x, by, z, &block, upper);
+        if mine >= action_costs::COST_INF {
+            return MoveResult {
+                x: 0,
+                y: 0,
+                z: 0,
+                cost: action_costs::COST_INF,
+            };
+        }
+        cost += mine;
+    }
+    MoveResult {
+        x,
+        y: y + 1,
+        z,
+        cost,
     }
 }
 
@@ -1900,6 +1958,20 @@ pub fn movement_breaks(
     y: i32,
     z: i32,
 ) -> Vec<(i32, i32, i32)> {
+    let mut out = Vec::new();
+    let price = |out: &mut Vec<(i32, i32, i32)>, bx: i32, by: i32, bz: i32, upper: bool| {
+        let block = world.get_block(bx, by, bz);
+        if mining_cost(world, tools, bx, by, bz, &block, upper) > 0.0 {
+            out.push((bx, by, bz));
+        }
+    };
+    // Straight-up moves (pillar hop, swim-up) break only the two cells
+    // they rise into; no horizontal direction is involved.
+    if matches!(mv, Moves::PillarUp | Moves::SwimUp) {
+        price(&mut out, x, y + 1, z, false);
+        price(&mut out, x, y + 2, z, true);
+        return out;
+    }
     let (dx, dz) = match mv {
         Moves::TraverseNorth | Moves::AscendNorth | Moves::DescendNorth | Moves::BridgeNorth => {
             (0, -1)
@@ -1910,19 +1982,11 @@ pub fn movement_breaks(
         Moves::TraverseEast | Moves::AscendEast | Moves::DescendEast | Moves::BridgeEast => (1, 0),
         Moves::TraverseWest | Moves::AscendWest | Moves::DescendWest | Moves::BridgeWest => (-1, 0),
         // Diagonals edge through a clear corner without mining; parkour
-        // jumps and the pillar's straight-up hop clear their own way.
-        // Neither breaks anything.
+        // jumps clear their own way. Neither breaks anything.
         _ => return Vec::new(),
     };
     let dest_x = x + dx;
     let dest_z = z + dz;
-    let price = |out: &mut Vec<(i32, i32, i32)>, bx: i32, by: i32, bz: i32, upper: bool| {
-        let block = world.get_block(bx, by, bz);
-        if mining_cost(world, tools, bx, by, bz, &block, upper) > 0.0 {
-            out.push((bx, by, bz));
-        }
-    };
-    let mut out = Vec::new();
     match mv {
         Moves::TraverseNorth | Moves::TraverseSouth | Moves::TraverseEast | Moves::TraverseWest => {
             price(&mut out, dest_x, y, dest_z, false);
@@ -1946,10 +2010,6 @@ pub fn movement_breaks(
         | Moves::BridgeWest => {
             price(&mut out, dest_x, y, dest_z, false);
             price(&mut out, dest_x, y + 1, dest_z, true);
-        }
-        Moves::PillarUp => {
-            price(&mut out, x, y + 1, z, false);
-            price(&mut out, x, y + 2, z, true);
         }
         _ => {}
     }

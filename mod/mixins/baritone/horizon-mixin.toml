@@ -1,11 +1,11 @@
 [mod]
 id = "baritone"
-version = "1.2.0"
+version = "1.3.0"
 priority = 100
 
 # The commit it was tested on: it patches the client's tick loop, chat
-# command dispatch and mods list, so a Horizon change there needs a
-# re-check.
+# command dispatch, mods list and the debug-gizmos renderer, so a Horizon
+# change there needs a re-check.
 [compatibility]
 horizon_revision = "af55a734865da4f1b11836164a979ff06a1f0449"
 
@@ -93,3 +93,11 @@ bindings = [
   { name = "command", ty = "&str", value = "command" },
   { name = "ran", ty = "&mut bool", value = "&mut *ran" },
 ]
+
+# The world-space rendering (goal, path, work blocks) is not an injection:
+# the mixin tool refuses injections into any function whose body has
+# closures, and the whole frame line path is closure-heavy. Instead the
+# build's stage patch (tools/stage_patch.py) calls the mod's tested
+# `bot::render_scene` right where the game gathers its debug gizmos —
+# see the comment there.
+

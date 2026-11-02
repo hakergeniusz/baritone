@@ -89,7 +89,20 @@ fn baritone_tick(game: &mut crate::game::Game<'_>) {
     let (inputs, messages) = {
         let reader = |x: i32, y: i32, z: i32| game.native_block([x, y, z]);
         let world = crate::game::baritone::world_view::LiveWorld::new(&reader);
-        bot::tick_stateful(&world, &player)
+        // The nearby entities, for /follow: every alive mob the game
+        // tracks (other players included), with the nametag when worn.
+        let entities: Vec<bot::EntityInfo> = game
+            .mobs
+            .iter()
+            .filter(|m| !m.removed)
+            .map(|m| bot::EntityInfo {
+                id: m.id,
+                kind: String::from(m.kind.id.trim_start_matches("minecraft:")),
+                name: m.custom_name.clone(),
+                pos: (m.position.x, m.position.y, m.position.z),
+            })
+            .collect();
+        bot::tick_stateful(&world, &player, &entities)
     };
     for message in messages {
         game.native_chat(&message);
