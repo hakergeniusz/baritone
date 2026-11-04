@@ -220,7 +220,14 @@ impl Goal for GoalNear {
         let dx = (x - self.x) as f64;
         let dy = (y - self.y) as f64;
         let dz = (z - self.z) as f64;
-        dx * dx + dy * dy + dz * dz <= self.range * self.range
+        // Java adds a half-block grace (`GoalNear.isInRange` builds
+        // `(range + 0.5)²`): the goal reads the BLOCK the feet stand in,
+        // whose center can sit half a block outside the bare radius.
+        // Without it a mine target three under the player reads as out
+        // of reach (Euclidean 11 > 9) and the bot plans a descend-walk
+        // instead of digging straight toward it.
+        let range_sq = (self.range + 0.5) * (self.range + 0.5);
+        dx * dx + dy * dy + dz * dz <= range_sq
     }
 
     /// Ported verbatim from `GoalNear.heuristic`: baritone reuses the

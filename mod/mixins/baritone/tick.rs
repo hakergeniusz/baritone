@@ -214,10 +214,15 @@ fn baritone_tick(game: &mut crate::game::Game<'_>) {
             return false;
         }
         match game.clip_ray(origin, view(game.yaw, game.pitch), reach) {
-            Some(hit) => {
-                let block = game.native_block(hit.pos);
-                !bot::is_passable(&block)
-            }
+            // Anything the center ray reaches is swing-worthy: a solid
+            // block stands between the eye and the target (breaking it
+            // is progress toward the target either way), and a passable
+            // one — the snow layer over the block underfoot, tall grass
+            // — the game's own mining skips to break the block behind
+            // it. Refusing a passable hit stalls the whole dig: the bot
+            // stands on snow over the block it must break, the ray
+            // keeps hitting the snow, and the swing never happens.
+            Some(_) => true,
             None => false,
         }
     }

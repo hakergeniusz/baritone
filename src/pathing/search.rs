@@ -376,9 +376,16 @@ pub fn path_finder(
     let mut closed: HashSet<(i32, i32, i32)> = HashSet::new();
     let mut nodes_considered: i32 = 0;
 
-    // Verify the start position is walkable.
+    // Verify the start position is walkable — or at least occupiable:
+    // baritone's PathStart tolerates a water column (the player swims
+    // from there) and the executor re-plans mid-fall, so a start the
+    // player can occupy seeds the search instead of refusing it. The old
+    // gate read the water below a swimmer as unwalkable ground and every
+    // re-plan died, stranding the swim.
     // (Baritone checks this before searching.)
-    if !crate::pathing::movement::can_walk_on(world, sx, sy - 1, sz) {
+    if !crate::pathing::movement::can_walk_on(world, sx, sy - 1, sz)
+        && !crate::pathing::movement::can_walk_through(world, sx, sy, sz)
+    {
         log::warn!("start position {sx} {sy} {sz} is not walkable");
         return None;
     }
@@ -401,6 +408,14 @@ pub fn path_finder(
         best_heuristic[i] = start_node.estimated_cost_to_goal;
         best_nodes[i] = Some(start_node.clone());
     }
+    // The pure goal-estimate track, free of the cost/coeff mixing: the
+    // coefficient tracks keep the search honest on cost, but in terrain
+    // where every move is expensive (digging through stone bare-handed)
+    // they never leave the start, and the partial below would refuse a
+    // perfectly good one-block descend. This track follows pure progress
+    // toward the goal instead.
+    let mut best_progress = Some(start_node.clone());
+    let mut best_progress_estimate = start_node.estimated_cost_to_goal;
 
     while nodes_considered < config.max_nodes {
         let Some(current) = open_set.remove_lowest() else {
@@ -460,6 +475,10 @@ pub fn path_finder(
                     best_nodes[i] = Some(node.clone());
                 }
             }
+            if node.estimated_cost_to_goal < best_progress_estimate - 0.01 {
+                best_progress_estimate = node.estimated_cost_to_goal;
+                best_progress = Some(node.clone());
+            }
         }
     }
 
@@ -485,6 +504,21 @@ pub fn path_finder(
             );
             return Some(reconstruct_path(node, nodes_considered, goal, world, tools));
         }
+    }
+
+    // Enclosed spaces (a 1-wide shaft the bot dug itself) end the search
+    // with every track shorter than MIN_DIST_PATH — refusing them would
+    // strand the bot one plan after it starts digging down. Take the best
+    // pure-progress track when it actually approaches the goal: a
+    // one-block descend is exactly what a shaft needs, and it re-plans
+    // from the new floor. A dead end (a flooded column: every breaking
+    // move is COST_INF) offers no track that improves the estimate, so it
+    // still comes back None and the mission can escape.
+    if let Some(node) = best_progress
+        && node.estimated_cost_to_goal < start_node.estimated_cost_to_goal - 0.01
+    {
+        log::warn!("A* search exhausted short of MIN_DIST_PATH: taking a progress partial");
+        return Some(reconstruct_path(&node, nodes_considered, goal, world, tools));
     }
 
     log::warn!(

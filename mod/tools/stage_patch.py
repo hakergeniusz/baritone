@@ -32,9 +32,12 @@ REPLACEMENT = """        let mut lines = self.fishing_line(alpha, size);
         // own debug gizmos. Primitives come from the mod's tested
         // render_scene; the scene is empty while the bot is idle.
         {
-            let scene = crate::game::baritone::bot::with_state(
-                |state| crate::game::baritone::bot::render_scene(state),
-            );
+            // baritone mod: the scene as of the last brain tick. This
+            // runs on the render thread holding the game's own locks —
+            // it must not take the bot-state lock (the brain holds it
+            // while reading the world; both directions once deadlocked
+            // the client), so the tick publishes a cached copy instead.
+            let scene = crate::game::baritone::bot::cached_scene();
             for (min, max, color) in &scene.boxes {
                 g.cuboid(*min, *max, *color, horizon_client::gizmos::STROKE_WIDTH);
             }
@@ -43,6 +46,81 @@ REPLACEMENT = """        let mut lines = self.fishing_line(alpha, size);
             }
         }
         lines.extend(g.lines);
+"""
+
+# Second patch: keep the bot driving while a screen (the chat) is open.
+# The game's motion reads the key set only while `Screen::Playing`, and
+# the key set collects the user's physical presses even behind a screen,
+# so the patch drives the movement keys from the brain's own inputs
+# instead — nothing the user types leaks into the motion.
+MOTION_ANCHOR = """        let playing = self.screen == Screen::Playing && self.sleeping.is_none();
+        let held = |k| playing && self.keys.contains(&k);
+        let keys = Keys {
+            forward: held(KeyCode::KeyW),
+            backward: held(KeyCode::KeyS),
+            left: held(KeyCode::KeyA),
+            right: held(KeyCode::KeyD),
+            jump: held(KeyCode::Space),
+            shift: held(KeyCode::ShiftLeft),
+            sprint: held(KeyCode::ControlLeft),
+            analog: None,
+        }
+            .with_stick(stick.filter(|_| playing));
+"""
+
+MOTION_REPLACEMENT = """        let playing = self.screen == Screen::Playing && self.sleeping.is_none();
+        let held = |k| playing && self.keys.contains(&k);
+        // baritone mod: keep the bot driving while a screen (the chat)
+        // is open — the game ignores the key set behind a screen, so the
+        // brain's own inputs move the player instead. The user's presses
+        // stay inert behind the screen: typing "w" in chat must not walk.
+        let keys = if let Some((fwd, jump, sprint, _)) = (!playing)
+            .then(crate::game::baritone::bot::screen_inputs)
+            .flatten()
+        {
+            Keys {
+                forward: fwd,
+                backward: false,
+                left: false,
+                right: false,
+                jump,
+                shift: false,
+                sprint,
+                analog: None,
+            }
+        } else {
+            Keys {
+                forward: held(KeyCode::KeyW),
+                backward: held(KeyCode::KeyS),
+                left: held(KeyCode::KeyA),
+                right: held(KeyCode::KeyD),
+                jump: held(KeyCode::Space),
+                shift: held(KeyCode::ShiftLeft),
+                sprint: held(KeyCode::ControlLeft),
+                analog: None,
+            }
+        }
+        .with_stick(stick.filter(|_| playing));
+"""
+
+MINE_ANCHOR = """        if !self.left || self.screen != Screen::Playing {
+            self.mining = None;
+            return Ok(());
+        }
+"""
+
+MINE_REPLACEMENT = """        // baritone mod: the bot keeps mining while a screen (the chat)
+        // is open — the mixin only holds the button on a verified hit.
+        if !self.left
+            || (self.screen != Screen::Playing
+                && !matches!(
+                    crate::game::baritone::bot::screen_inputs(),
+                    Some((_, _, _, true))
+                ))
+        {
+            self.mining = None;
+            return Ok(());
+        }
 """
 
 
@@ -57,6 +135,19 @@ def main() -> None:
             "the client source changed; re-check the render patch"
         )
         sys.exit(1)
+    if "baritone::bot::screen_inputs" not in text:
+        for name, anchor, replacement in (
+            ("motion", MOTION_ANCHOR, MOTION_REPLACEMENT),
+            ("mine", MINE_ANCHOR, MINE_REPLACEMENT),
+        ):
+            c = text.count(anchor)
+            if c != 1:
+                print(
+                    f"stage_patch: expected exactly 1 {name} anchor in game.rs, "
+                    f"found {c} — the client source changed; re-check the patch"
+                )
+                sys.exit(1)
+            text = text.replace(anchor, replacement)
     if "baritone::bot::render_scene" in text:
         print("stage_patch: already applied")
         return

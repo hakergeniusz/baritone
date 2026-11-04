@@ -368,6 +368,13 @@ pub mod block_tags {
         base == "minecraft:sweet_berry_bush"
     }
 
+    /// Thin snow layers: passable to the planner — the layer's collision
+    /// rests the player on top, and the executor mines the cap when a
+    /// move's collision needs it (the layer breaks in a few ticks).
+    pub fn is_snow_layer(block: &str) -> bool {
+        strip_props(block) == "minecraft:snow"
+    }
+
     /// Powder snow — the player sinks in and freezes (baritone's
     /// `canWalkThroughBlockState` refuses it outright).
     pub fn is_powder_snow(block: &str) -> bool {
@@ -579,7 +586,7 @@ pub fn is_placeable(item: &str) -> bool {
 }
 
 /// Check if the player can walk *through* (occupy the same space as) a block.
-fn can_walk_through(world: &LiveWorld, x: i32, y: i32, z: i32) -> bool {
+pub fn can_walk_through(world: &LiveWorld, x: i32, y: i32, z: i32) -> bool {
     let block = world.get_block(x, y, z);
     if block_tags::is_air(&block) {
         return true;
@@ -588,6 +595,12 @@ fn can_walk_through(world: &LiveWorld, x: i32, y: i32, z: i32) -> bool {
     // full solid cubes, so walking through a canopy would need mining,
     // which the executor can't do.
     if block_tags::is_ground_cover(&block) {
+        return true;
+    }
+    // Thin snow layers: the collision rests the player on top, so a plan
+    // that drops through one needs the executor to mine the cap (it does
+    // — the down-probe and the break filters read snow as breakable).
+    if block_tags::is_snow_layer(&block) {
         return true;
     }
     // Water is passable (you wade or swim through it).
@@ -1399,6 +1412,7 @@ pub mod hardness {
             ("gravel", 0.6, false),
             ("soul_sand", 0.5, false),
             ("soul_soil", 0.5, false),
+            ("snow", 0.1, false),
             ("snow_block", 0.2, true),
             ("powder_snow", 0.2, false),
             ("moss_block", 0.1, false),
@@ -2136,6 +2150,11 @@ mod tests {
         // through in six ticks.
         assert_eq!(hardness::entry("powder_snow"), Some((0.2, false)));
         assert_eq!(hardness::entry("minecraft:powder_snow[holding=false]"), Some((0.2, false)));
+        // The thin snow layer: priced (the executor breaks it in a few
+        // ticks), not the stone-like fallback, not unbreakable.
+        assert_eq!(hardness::entry("snow"), Some((0.1, false)));
+        assert_eq!(hardness::entry("minecraft:snow[layers=1]"), Some((0.1, false)));
+        assert!(hardness::break_ticks("snow") < hardness::break_ticks("dirt"));
         assert_eq!(
             ToolSet::hand().break_ticks_with("powder_snow"),
             6.0
