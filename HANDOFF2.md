@@ -1,5 +1,15 @@
 # HANDOFF 2 — baritone→Horizon port: stall fix written, not yet applied
 
+> **RESOLVED 2026-11-04** — everything below was applied, extended by the
+> snow-rest / water-start / step-up / ray-probe fixes, verified live
+> (descent stall-free, /goto, chat-open drive), tested 58/58, committed as
+> `3554f4d` and pushed. The known remaining issues are at the bottom of the
+> memory file (`baritone-horizon-port.md`, Nov 4 entry): escape walks can
+> freeze on freshly streamed terrain (LiveWorld reads air where the game
+> rests the player — the 3-dead-end cap then ends /mine legally), powder
+> snow is unpathable by design, and the live deep-water swim rig needs
+> water settling time (sim-verified only).
+
 Written 2026-11-03, mid-fix. Read `HANDOFF.md` first for the original four
 failures and the environment. Everything there is resolved except what this
 file says is still open. Repo is on this machine (`~/Projects/baritone`),
